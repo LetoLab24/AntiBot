@@ -40,19 +40,39 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 
 nginx_ok() { command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; }
 nginx_reload() { nginx -s reload 2>/dev/null || systemctl reload nginx; }
+# nginx читает файл: nginx -T печатает каждый подключённый файл строкой «# configuration file ПУТЬ:».
+# grep без -q: с -q он закрывает канал раньше, nginx получает SIGPIPE и при pipefail проверка не проходит
+nginx_reads() { nginx -T 2>/dev/null | grep -F "# configuration file $1:" >/dev/null; }
+
+# значение из antibot.ini (последнее, без пробелов вокруг «=»)
+ini_get() { sed -n "s/^$1[[:space:]]*=[[:space:]]*//p" "$ETC/antibot.ini" 2>/dev/null | tail -1; }
+# записать значение в раздел [paths] antibot.ini
+ini_set_path() {
+    if grep -q "^$1[[:space:]]*=" "$ETC/antibot.ini"; then
+        sed -i "s|^$1[[:space:]]*=.*|$1 = $2|" "$ETC/antibot.ini"
+    elif grep -q '^\[paths\]' "$ETC/antibot.ini"; then
+        sed -i "/^\[paths\]/a $1 = $2" "$ETC/antibot.ini"
+    else
+        printf '\n[paths]\n%s = %s\n' "$1" "$2" >> "$ETC/antibot.ini"
+    fi
+}
+BX_HTTP=/etc/nginx/bx/maps/antibot.conf
 
 # ---------------------------------------------------------------- удаление
 if [ "$REMOVE" = 1 ]; then
     rm -f "$CRON" "$LOGROTATE" "$SUDOERS" "$BIN"
     say "cron, logrotate и команда antibot убраны"
     if command -v nginx >/dev/null 2>&1; then
-        FILES=$(grep -rl 'antibot-site.conf' /etc/nginx 2>/dev/null | grep -v '/snippets/antibot-site.conf$' || true)
+        HTTP_CONF=$(ini_get nginx_http_conf); HTTP_CONF=${HTTP_CONF:-/etc/nginx/conf.d/antibot.conf}
+        SITE_CONF=$(ini_get nginx_site_conf); SITE_CONF=${SITE_CONF:-/etc/nginx/snippets/antibot-site.conf}
+        SITE_NAME=$(basename "$SITE_CONF")
+        FILES=$(grep -rlF "$SITE_NAME" /etc/nginx 2>/dev/null | grep -vxF "$SITE_CONF" | grep -v '\.antibot-bak-' || true)
         for f in $FILES; do
             cp -p "$f" "$f.antibot-bak-$STAMP"
-            sed -i '/include .*antibot-site\.conf;/d' "$f"
+            sed -i "/include .*${SITE_NAME//./\\.};/d" "$f"
             say "убрана строка include из $f (бэкап $f.antibot-bak-$STAMP)"
         done
-        rm -f /etc/nginx/conf.d/antibot.conf /etc/nginx/snippets/antibot-site.conf
+        rm -f "$HTTP_CONF" "$SITE_CONF"
         if nginx_ok; then
             nginx_reload
             say "nginx перечитан — баны сняты"
@@ -94,10 +114,19 @@ if [ ! -f "$ETC/antibot.ini" ]; then
     [ -n "$IPS" ] && sed -i "s|^server_ips =.*|server_ips = $IPS|" "$ETC/antibot.ini"
     for L in /var/log/nginx/access.log /var/log/apache2/access.log /var/log/httpd/access_log; do
         if [ -f "$L" ]; then
-            sed -i "s|^log = .*|log = $L|; s|^log_archives = .*|log_archives = $L.*|" "$ETC/antibot.ini"
+            sed -i "s|^log = .*|log = $L|; s|^log_archives = .*|log_archives = $L[.-]*|" "$ETC/antibot.ini"
             break
         fi
     done
+    # BitrixVM: nginx подключает bx/maps, а не conf.d; журнал — в своём формате
+    if [ -d /etc/nginx/bx/maps ]; then
+        ini_set_path nginx_http_conf "$BX_HTTP"
+        say "BitrixVM: файл уровня http — $BX_HTTP"
+    fi
+    if command -v nginx >/dev/null 2>&1 && nginx -T 2>/dev/null | grep -F 'time_local - $upstream_response_time]' >/dev/null; then
+        sed -i 's|^log_format = .*|log_format = bitrixvm|' "$ETC/antibot.ini"
+        say "журнал в формате BitrixVM — log_format = bitrixvm"
+    fi
     [ "$REPORT_ONLY" = 1 ] && sed -i 's|^mode = .*|mode = report|' "$ETC/antibot.ini"
     say "настройки — $ETC/antibot.ini: впишите домен, почту и контакт (адреса сервера и журнал подставлены)"
 else
@@ -126,6 +155,21 @@ say "cron и logrotate поставлены"
 
 if [ "$REPORT_ONLY" = 0 ] && command -v nginx >/dev/null 2>&1; then
     "$BIN" --nginx-files || die "файлы nginx не записаны (см. выше); сторож работает без банов"
+    HTTP_CONF=$(ini_get nginx_http_conf); HTTP_CONF=${HTTP_CONF:-/etc/nginx/conf.d/antibot.conf}
+    if nginx -T >/dev/null 2>&1 && ! nginx_reads "$HTTP_CONF"; then
+        # файл лежит в папке, которую nginx не подключает: на BitrixVM — переложить в bx/maps
+        if [ -d /etc/nginx/bx/maps ] && [ "$HTTP_CONF" != "$BX_HTTP" ]; then
+            rm -f "$HTTP_CONF"
+            ini_set_path nginx_http_conf "$BX_HTTP"
+            "$BIN" --nginx-files || die "файлы nginx не записаны (см. выше); сторож работает без банов"
+            HTTP_CONF=$BX_HTTP
+            say "nginx не читает conf.d — файл уровня http перенесён в $BX_HTTP"
+        fi
+        nginx_reads "$HTTP_CONF" || die "nginx не читает $HTTP_CONF (его нет в nginx -T). Впишите в http { } строку
+  include $HTTP_CONF;
+или укажите в $ETC/antibot.ini, раздел [paths], nginx_http_conf в папке, которую nginx подключает,
+и запустите установку ещё раз. Пока сторож только наблюдает, баны до nginx не доходят."
+    fi
     if [ -n "$VHOST" ]; then
         [ -f "$VHOST" ] || die "нет файла сайта: $VHOST"
         if grep -q 'antibot-site.conf' "$VHOST"; then

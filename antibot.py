@@ -27,7 +27,7 @@
 Режимы: observe — «закрыл бы» в базу, по-настоящему закрывает только правила из enforce_always (сканеры);
 enforce — закрывает всех; report — никого не закрывает и nginx не трогает. MAIL_DRY=1 — письма в консоль.
 """
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 
 import calendar, collections, configparser, glob, gzip, html, ipaddress, json, os, pickle, re
 import shlex, smtplib, socket, sqlite3, subprocess, sys, threading, time, traceback, urllib.parse, urllib.request
@@ -45,6 +45,11 @@ DRY_MAIL = bool(os.environ.get('MAIL_DRY'))
 PIPE = subprocess.PIPE
 MONTHS = {m: i for i, m in enumerate(('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'), 1)}
 COMBINED = re.compile(r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+)[^"]*" (\d{3}) (\d+|-) "([^"]*)" "([^"]*)"')
+# готовые форматы журнала (log_format в настройках). BitrixVM: код ответа до запроса, в скобках с датой — время ответа
+LOG_FORMATS = {
+    'bitrixvm': r'^(?P<ip>\S+) \S+ \S+ \[(?P<time>\d\d/\w{3}/\d{4}:\d\d:\d\d:\d\d [+-]\d{4})[^\]]*\] (?P<status>\d{3}) '
+                r'"(?P<method>[A-Z]+) (?P<url>\S+)[^"]*" (?P<size>\d+|-)(?: "(?P<referer>[^"]*)" "(?P<ua>[^"]*)")?',
+}
 MAX_READ = 64 << 20                      # за один проход — не больше 64 МБ журнала
 PROBE_KEY = '_probe'                     # в review.uas: имена браузеров, под которыми адрес делал пробы
 PLAIN_PAGE = re.compile(r'^/(?:[^.?]*|[^?]*\.html?)$', re.I)
@@ -182,7 +187,9 @@ class Settings:
         self.rules = _ini(self.rules_path, required=True)
         self.domain = g('site', 'domain', 'localhost')
         self.log = g('site', 'log', '/var/log/nginx/access.log')
-        self.log_archives = g('site', 'log_archives', self.log + '.*')
+        self.log_archives = g('site', 'log_archives', self.log + '[.-]*')
+        if self.log_archives == self.log + '.*':
+            self.log_archives = self.log + '[.-]*'      # прежнее значение по умолчанию не видит архивы с датой
         self.log_format = g('site', 'log_format', 'combined')
         self.log_regex = g('site', 'log_regex')
         self.time_format = g('site', 'time_format', 'clf')
@@ -295,6 +302,9 @@ class Rules:
         self.se_ua = [(re.compile(v, re.I), fam) for fam, v in R.items('search_engines')
                       if fam not in R.defaults()]
         self.se_domains = {fam: tuple(v.split()) for fam, v in R.items('se_domains') if fam not in R.defaults()}
+        # сети поисковиков, чьи роботы ходят без имени в DNS: адрес из сети — настоящий робот
+        self.se_nets = {fam: NetSet(v.split()) for fam, v in R.items('se_nets')
+                        if fam not in R.defaults()} if R.has_section('se_nets') else {}
         self.ai_ua = [tuple(l.split()[:2]) for l in lines('ai_bots', 'list') if len(l.split()) >= 2]
         self.ai_rdns = {fam: tuple(v.split()) for fam, v in R.items('ai_rdns')} if R.has_section('ai_rdns') else {}
         self.ai_lists = {fam: v.split() for fam, v in R.items('ai_lists')} if R.has_section('ai_lists') else {}
@@ -382,11 +392,15 @@ class Rules:
 class LogParser:
     def __init__(self, s):
         self.custom = None
-        if s.log_format == 'custom':
+        self.ip_first = s.log_format in ('combined', 'bitrixvm')   # строка начинается с адреса
+        self.tf = s.time_format
+        if s.log_format in LOG_FORMATS:
+            self.custom = re.compile(LOG_FORMATS[s.log_format])
+            self.tf = 'clf'
+        elif s.log_format == 'custom':
             if not s.log_regex:
                 raise SystemExit('log_format = custom, но log_regex не задан')
             self.custom = re.compile(s.log_regex)
-        self.tf = s.time_format
         self._t = {}
 
     def minute(self, ts):
@@ -459,7 +473,7 @@ def log_files(s, since_ts):
 def scan_logs(s, parser, since_ts, ip=None):
     """Разобранные строки журналов за период (порядок — по файлам)."""
     since_min = since_ts // 60
-    prefix = ip + ' ' if ip and not parser.custom else None
+    prefix = ip + ' ' if ip and parser.ip_first else None
     for f in log_files(s, since_ts):
         try:
             with open_log(f) as fh:
@@ -590,13 +604,21 @@ def rdns_many(ips, wait=4.0):
     return {ip: v[1] for ip, v in list(out.items())}
 
 
+def dns_verdict(r, fam, ok, host):
+    """Нет имени в DNS у поисковика, чьи роботы так и ходят (Mail.ru), — не подделка, а «проверить нечем» (-1)."""
+    if ok == 0 and not host and fam in r.se_nets:
+        return -1
+    return ok
+
+
 class Verifier:
-    """Обратный + прямой DNS для поисковиков; опубликованные списки адресов для OpenAI и Perplexity."""
+    """Обратный + прямой DNS для поисковиков; сети поисковиков без имени в DNS; опубликованные списки адресов
+    для OpenAI и Perplexity."""
 
     def __init__(self, s, r, store):
         self.s, self.r, self.st = s, r, store
-        self.cache = {row[0]: (row[1], row[2]) for row in store.q('SELECT ip, fam, ok FROM dns WHERE checked > ?',
-                                                                  (now() - 7 * 86400,))}
+        self.cache = {row[0]: (row[1], dns_verdict(r, row[1], row[2], row[3]))
+                      for row in store.q('SELECT ip, fam, ok, host FROM dns WHERE checked > ?', (now() - 7 * 86400,))}
         self.lists = self._load_lists()
 
     def _load_lists(self):
@@ -633,17 +655,28 @@ class Verifier:
                 pass
         return {fam: NetSet(nets) for fam, nets in data.items() if fam != '_ts'}
 
-    def in_lists(self, ip):
-        return any(ip in n for n in self.lists.values())
+    def in_lists(self, ip, ua=''):
+        """Адрес из опубликованного списка ИИ-компании или из сети поисковика, чьим именем назвался."""
+        if any(ip in n for n in self.lists.values()):
+            return True
+        cls, fam = self.r.ua_class(ua) if ua else ('', '')
+        return cls == 'se' and fam in self.r.se_nets and ip in self.r.se_nets[fam]
 
     def status(self, ip, cls, fam):
-        """1 — подтверждён, 0 — подделка, None — ещё не проверен или проверить нечем."""
+        """1 — подтверждён, 0 — подделка, -1 — проверить нечем (у адреса нет имени в DNS, а этот поисковик
+        так и ходит, но адрес не из его сетей), None — ещё не проверен."""
         if cls == 'ai' and fam in self.lists:
             return 1 if ip in self.lists[fam] else 0
+        if cls == 'se' and fam in self.r.se_nets and ip in self.r.se_nets[fam]:
+            return 1
         v = self.cache.get(ip)
         if v and v[0] == fam:
             return v[1]
         return None
+
+    def checked(self, ip, fam):
+        v = self.cache.get(ip)
+        return bool(v and v[0] == fam)
 
     def suffixes(self, fam):
         return self.r.se_domains.get(fam) or self.r.ai_rdns.get(fam)
@@ -664,6 +697,7 @@ class Verifier:
         for t, ip, fam in threads:
             if ip in out:
                 ok, host = out[ip]
+                ok = dns_verdict(self.r, fam, ok, host)
                 self.cache[ip] = (fam, ok)
                 self.st.q('INSERT OR REPLACE INTO dns VALUES(?,?,?,?,?)', (ip, fam, ok, host, now()))
 
@@ -1171,7 +1205,8 @@ class Guard:
         ver = self.ver
         UA = S['UA']
         todo = [(ip, UA[ip][2]) for ip in self.active if ip in UA and UA[ip][1] in ('se', 'ai')
-                and ver.status(ip, UA[ip][1], UA[ip][2]) is None and ver.suffixes(UA[ip][2])]
+                and ver.status(ip, UA[ip][1], UA[ip][2]) is None and not ver.checked(ip, UA[ip][2])
+                and ver.suffixes(UA[ip][2])]
         if todo:
             ver.check(todo)
         for ip in self.active:
@@ -1214,6 +1249,7 @@ class Guard:
                     rule = 'fake_se'
                 elif vs is None and f5[D] < th('rate_dyn_5'):
                     continue                                  # ждём проверки DNS
+                # vs == -1 (проверить нечем): не подделка, но правила для всех — парсер, частота, пробы — действуют
             elif cls == 'ai':
                 vs = ver.status(ip, cls, fam)
                 k = th('ai_factor')
@@ -1490,7 +1526,7 @@ def review_pass(s, store, ver, allow, mailer, enforced_mode):
         # другие браузеры за адресом: не тот UA, под которым шёл бот, и запросов мало — так выглядят люди за NAT.
         # Имя, под которым адрес делал пробы, — сам сканер.
         others = [u for u, n in uas.items() if u != (bot_ua or '')[:150] and u not in probe_uas and n <= 20]
-        in_list = ver.in_lists(ip)
+        in_list = ver.in_lists(ip, bot_ua)
         ev = []
         if hits:
             ev.append('после бана %d запросов, из них страниц каталога %d' % (hits, pages))
@@ -1524,7 +1560,7 @@ def review_pass(s, store, ver, allow, mailer, enforced_mode):
         if verdict == 'good-bot':
             action = 'снят сам'
             if (rdns_ok == 1 or in_list) and ip not in allow:
-                note = 'хороший бот по DNS: %s' % rdns if rdns_ok == 1 else 'адрес из списка ИИ-компании'
+                note = 'хороший бот по DNS: %s' % rdns if rdns_ok == 1 else 'адрес из опубликованной сети компании'
                 allow_add(s, ip, '%s, добавил сторож %s' % (note, time.strftime('%d.%m.%Y', time.localtime(t))))
         elif verdict == 'human':
             prev = store.q("SELECT COUNT(*) FROM review_log WHERE ip=? AND action='снят сам' AND ts > ?",
@@ -1600,14 +1636,18 @@ def read_new(s, store, parser):
     lines = []
     off = pos.get('off', 0)
     if pos.get('ino') != stt.st_ino:
-        # журнал повернули: дочитать хвост прежнего файла (обычно .1, без сжатия), потом новый с начала
-        for old in (s.log + '.1',):
+        # журнал повернули: дочитать хвост прежнего файла, потом новый с начала. Прежний файл ищем по inode:
+        # access.log.1 или с датой (logrotate dateext: access.log-20261028), без сжатия
+        olds = [s.log + '.1'] + [f for f in sorted(glob.glob(s.log_archives), reverse=True) if not f.endswith('.gz')]
+        for old in olds:
             try:
-                if os.stat(old).st_ino == pos.get('ino'):
-                    with open(old, 'rb') as f:
-                        f.seek(off)
-                        chunk = f.read(MAX_READ)
-                    lines += chunk.decode('utf-8', 'replace').splitlines()
+                if os.path.realpath(old) == os.path.realpath(s.log) or os.stat(old).st_ino != pos.get('ino'):
+                    continue
+                with open(old, 'rb') as f:
+                    f.seek(off)
+                    chunk = f.read(MAX_READ)
+                lines += chunk.decode('utf-8', 'replace').splitlines()
+                break
             except OSError:
                 pass
         off = 0
@@ -1775,12 +1815,24 @@ def aggregate(s, r, parser, since, ip=None, after=None):
     return A
 
 
-def signs(a, rdns=''):
-    """-> (за бота, за человека: сильные, слабые)."""
+def se_state(r, dns, ip, fam):
+    """Проверка поисковика для сводок: 1, 0, -1 или None (см. Verifier.status). dns — {адрес: (семья, ok, имя)}."""
+    if fam in r.se_nets and ip in r.se_nets[fam]:
+        return 1
+    v = dns.get(ip)
+    if v and v[0] == fam:
+        return dns_verdict(r, fam, v[1], v[2])
+    return None
+
+
+def signs(a, rdns='', se=None):
+    """-> (за бота, за человека: сильные, слабые). se — проверка поисковика (se_state)."""
     bot, strong, weak = [], [], []
     browsers = [u for u, n in a['puas'].items() if n <= 20]
-    if a['cls'] == 'se':
-        bot.append('назвался поисковиком (%s), DNS это не подтвердил' % a['fam'])
+    if a['cls'] == 'se' and se != 1:
+        bot.append('назвался поисковиком (%s), %s' % (a['fam'], {
+            0: 'DNS это не подтвердил',
+            -1: 'у адреса нет имени в DNS и он не из сетей поисковика — проверить нечем'}.get(se, 'DNS ещё не проверен')))
     elif a['cls'] == 'ai':
         weak.append('ИИ-бот %s' % a['fam'])
     if a['pages'] >= 10 and a['st'] == 0:
@@ -1816,9 +1868,13 @@ def signs(a, rdns=''):
     return bot, strong, weak
 
 
-def hint(a, bot, strong):
+def hint(a, bot, strong, se=None):
+    if a['cls'] == 'se' and se == 1:
+        return 'настоящий поисковик — не трогать'
     if a['probe'] >= 3 or a['sqli']:
         return 'сканер — закрыть'
+    if a['cls'] == 'se' and se == -1:
+        return 'неясно: поисковик без имени в DNS — сверить сеть по whois, прежде чем закрывать'
     if strong:
         return 'похоже, человек — не трогать' if len(bot) < 3 else 'неясно: есть признаки человека — смотреть --who'
     if len(bot) >= 2:
@@ -1852,13 +1908,14 @@ def cmd_daily(s, hours):
     # 4. журнал
     real_bans = {ip: row[3] for ip, row in active_bans.items() if row[2] > 0}
     A = aggregate(s, r, parser, since, after=real_bans)
-    dns_ok = {row[0] for row in store.q('SELECT ip FROM dns WHERE ok=1')}
+    dns = {row[0]: (row[1], row[2], row[3]) for row in store.q('SELECT ip, fam, ok, host FROM dns')}
+    dns_ok = {ip for ip, v in dns.items() if v[1] == 1}
     # вернулись к бану — запросы после начала бана; обычный ответ (200/304) после бана — бан не дошёл до nginx
     returned = [(ip, a) for ip, a in A.items() if ip in real_bans and a['after_codes']]
     leaking = [(ip, a) for ip, a in returned if a['after_codes'].get(200, 0) + a['after_codes'].get(304, 0) > 0]
     pool = []
     for ip, a in A.items():
-        if ip in allow or ip in dns_ok or ip in real_bans:
+        if ip in allow or ip in dns_ok or ip in real_bans or (a['cls'] == 'se' and se_state(r, dns, ip, a['fam']) == 1):
             continue
         if a['pages'] >= 20 or a['probe'] or a['head'] >= 5 or a['rf'] >= 10 or a['req'] >= 500:
             pool.append((ip, a))
@@ -1867,8 +1924,9 @@ def cmd_daily(s, hours):
     rd = rdns_many([ip for ip, _ in pool], wait=4.0) if pool else {}
     cands, people = [], []
     for ip, a in pool:
-        bot, strong, weak = signs(a, rd.get(ip, ''))
-        (people if hint(a, bot, strong).startswith('похоже, человек') else cands).append((ip, a))
+        se = se_state(r, dns, ip, a['fam'])
+        bot, strong, weak = signs(a, rd.get(ip, ''), se)
+        (people if hint(a, bot, strong, se).startswith('похоже, человек') else cands).append((ip, a))
     cands, people = cands[:15], people[:10]
     bots = collections.Counter()
     bot_ips = collections.defaultdict(set)
@@ -1906,7 +1964,11 @@ def cmd_daily(s, hours):
     scan_n = sum(n for (rule, enf), n in by_rule.items() if rule == 'scan')
     real_n = sum(n for (rule, enf), n in by_rule.items() if enf)
     would = [b for b in bl if not b[4]]
-    likely = [c for c in cands if hint(c[1], *signs(c[1], rd.get(c[0], ''))[:2]).startswith(('похоже, бот', 'сканер'))]
+    likely = []
+    for ip, a in cands:
+        se = se_state(r, dns, ip, a['fam'])
+        if hint(a, *signs(a, rd.get(ip, ''), se)[:2], se=se).startswith(('похоже, бот', 'сканер')):
+            likely.append((ip, a))
     short = []
     if not last_tick:
         short.append('Сторож ещё ни разу не работал (нет проходов) — проверить cron.')
@@ -1962,7 +2024,8 @@ def cmd_daily(s, hours):
         w('   нет')
     for i, (ip, a) in enumerate(cands, 1):
         rdns = rd.get(ip, '')
-        bot, strong, weak = signs(a, rdns)
+        se = se_state(r, dns, ip, a['fam'])
+        bot, strong, weak = signs(a, rdns, se)
         ua = a['uas'].most_common(1)[0][0] if a['uas'] else ''
         w('   %d) %s%s — запросов %s, страниц %s (товаров %s), часов %d · %s'
           % (i, ip, ' (' + rdns + ')' if rdns else '', fmt(a['req']), fmt(a['pages']), fmt(a['prod']), len(a['hours']),
@@ -1971,11 +2034,11 @@ def cmd_daily(s, hours):
             w('      за бота: ' + '; '.join(bot))
         if strong or weak:
             w('      за человека: ' + '; '.join(strong + weak))
-        w('      вывод: %s. Разбор: antibot --who %s' % (hint(a, bot, strong), ip))
+        w('      вывод: %s. Разбор: antibot --who %s' % (hint(a, bot, strong, se), ip))
     if people:
         w('   Активные, похожие на людей — не трогать (для сведения):')
         for ip, a in people:
-            bot, strong, weak = signs(a, rd.get(ip, ''))
+            bot, strong, weak = signs(a, rd.get(ip, ''), se_state(r, dns, ip, a['fam']))
             w('     %-16s страниц %s, запросов %s · %s' % (ip, fmt(a['pages']), fmt(a['req']), '; '.join(strong)))
     w('')
     w('5. Работа над ошибками (%d):' % len(rl))
@@ -2038,14 +2101,26 @@ def cmd_who(s, ip, hours):
     if not a:
         print('В журнале за период запросов нет.')
         return
-    bot, strong, weak = signs(a, rd)
+    se = None
+    if a['cls'] == 'se':
+        dns = {row[0]: (row[1], row[2], row[3]) for row in store.q('SELECT ip, fam, ok, host FROM dns WHERE ip=?', (ip,))}
+        se = se_state(r, dns, ip, a['fam'])
+        if se is None and r.se_domains.get(a['fam']):
+            out = {}
+            _rdns_check(ip, r.se_domains[a['fam']], out)
+            if ip in out:
+                se = dns_verdict(r, a['fam'], out[ip][0], out[ip][1])
+        if se == 1:
+            print('Настоящий поисковик %s: %s.' % (a['fam'], 'адрес из его сети' if a['fam'] in r.se_nets
+                                                  and ip in r.se_nets[a['fam']] else 'DNS подтвердил'))
+    bot, strong, weak = signs(a, rd, se)
     print('Всего: запросов %s, страниц %s (товаров %s), картинок/стилей %d, скриптов %d, подсказок %d, POST %d, HEAD %d, '
           'проб %d, отказов 403/429 %d, из поиска %d' % (fmt(a['req']), fmt(a['pages']), fmt(a['prod']), a['st'], a['js'],
                                                         a['ty'], a['post'], a['head'], a['probe'], a['rf'], a['se']))
     print('Коды: ' + ', '.join('%s — %d' % kv for kv in a['codes'].most_common()))
     print('За бота: ' + ('; '.join(bot) or '—'))
     print('За человека: ' + ('; '.join(strong + weak) or '—'))
-    print('Вывод: ' + hint(a, bot, strong))
+    print('Вывод: ' + hint(a, bot, strong, se))
     print('Браузеры (UA):')
     for u, n in a['uas'].most_common(8):
         print('  %6d  %s' % (n, u[:150]))
@@ -2248,6 +2323,13 @@ def cmd_check_config(s):
         s.path, s.rules_path, r.version, s.domain, s.engine, s.mode()))
     print('Журнал: %s (%s)' % (s.log, s.log_format))
     print('База: %s; nginx: %s' % (s.state_dir, s.nginx_dir or '—'))
+    if s.nginx_dir and s.nginx_dump:
+        code, out = run(s.nginx_dump)
+        if code == 0:
+            print('nginx: %s — %s; страница бана в сайте — %s' % (
+                s.nginx_http_conf, 'подключён' if '# configuration file %s:' % s.nginx_http_conf in out else
+                'НЕ подключён: nginx не читает этот файл, укажите в [paths] nginx_http_conf папку, которую он подключает',
+                'подключена' if '/__antibot-banned' in out else 'не подключена'))
     print('Почта: %s → %s%s' % (s.mail['method'] or ('smtp' if s.mail['smtp_host'] else 'sendmail'), s.mail['to'] or '(нет адреса!)',
                                  ', копия сводки: ' + s.mail['copy_to'] if s.mail['copy_to'] else ''))
     try:

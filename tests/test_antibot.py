@@ -158,6 +158,41 @@ class Patterns(Tmp):
         r2 = p2.parse('2026-10-10T14:39:01+03:00 2001:db8::5 GET /x 404 "Mozilla/5.0"')
         self.assertEqual(r2[0], '2001:db8::5')
         self.assertEqual(r2[1], t // 60)
+        # BitrixVM: код ответа до запроса, в скобках с датой — время ответа (бывает «-» и список через запятую)
+        b = ab.Settings(write_conf(self.d, extra='[x]\n'))
+        b.log_format = 'bitrixvm'
+        p3 = ab.LogParser(b)
+        for urt in ('0.123', '-', '0.050, 0.120'):
+            ln = ('203.0.113.1 - - [10/Oct/2026:14:39:01 +0300 - %s] 200 "GET /a?b=1 HTTP/1.1" 512 '
+                  '"https://shop.example/" "curl/8.0" "-"' % urt)
+            self.assertEqual(p3.parse(ln), ('203.0.113.1', t // 60, 'GET', '/a?b=1', 200, '512', 'https://shop.example/',
+                                            'curl/8.0'), urt)
+        self.assertTrue(p3.ip_first)
+        self.assertIsNone(p3.parse(line))                 # строка combined в формате BitrixVM не разбирается
+
+    def test_archives_default(self):
+        s = ab.Settings(write_conf(self.d))               # в настройках прежнее значение: access.log.*
+        self.assertEqual(s.log_archives, s.log + '[.-]*')
+        for name in ('access.log', 'access.log.1', 'access.log.2.gz', 'access.log-20261028', 'access.log-20261027.gz'):
+            open(os.path.join(self.d, name), 'w').close()
+        found = {os.path.basename(f) for f in ab.log_files(s, 0)}
+        self.assertEqual(found, {'access.log', 'access.log-20261028', 'access.log-20261027.gz', 'access.log.1',
+                                 'access.log.2.gz'})
+
+    def test_mailru_nets(self):
+        r = self.rules('custom')
+        st = ab.Store(os.path.join(self.d, 'st'))
+        ver = ab.Verifier(ab.Settings(write_conf(self.d)), r, st)
+        self.assertEqual(r.ua_class(make_log.MAILRU), ('se', 'mailru'))
+        self.assertEqual(ver.status('95.163.33.18', 'se', 'mailru'), 1)        # сеть VK
+        self.assertEqual(ver.status('217.174.191.100', 'se', 'mailru'), 1)
+        ver.check([('198.51.100.30', 'mailru'), ('198.51.100.20', 'google')])
+        self.assertEqual(ver.status('198.51.100.30', 'se', 'mailru'), -1)      # имени нет — проверить нечем
+        self.assertTrue(ver.checked('198.51.100.30', 'mailru'))
+        self.assertEqual(ver.status('198.51.100.20', 'se', 'google'), 0)       # Googlebot без имени — подделка
+        self.assertEqual(ver.status('95.163.33.18', 'se', 'google'), None)     # сеть VK — только для Mail.ru
+        self.assertTrue(ver.in_lists('95.163.33.18', make_log.MAILRU))
+        self.assertFalse(ver.in_lists('95.163.33.18', make_log.CHROME))
 
     def test_nginx_quote(self):
         for ua in ('Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'a.b+c*d? "q" \\back $x {y} [z] ^|'):
@@ -206,6 +241,26 @@ class Replay(Tmp):
 
     def test_woocommerce(self):
         self.check('woocommerce', make_log.EXPECT_WOO)
+
+
+class Rotation(Tmp):
+    def test_dateext_tail(self):
+        """После ротации с датой (logrotate dateext) хвост прежнего файла дочитывается."""
+        s = ab.Settings(write_conf(self.d))
+        st = ab.Store(s.state_dir)
+        parser = ab.LogParser(s)
+        with open(s.log, 'w', encoding='utf-8') as f:
+            f.write('old-1\n')
+        self.assertEqual(ab.read_new(s, st, parser)[0], [])           # первый запуск — с конца
+        with open(s.log, 'a', encoding='utf-8') as f:
+            f.write('old-2\nold-3\n')
+        os.rename(s.log, s.log + '-20261028')
+        with open(s.log, 'w', encoding='utf-8') as f:
+            f.write('new-1\n')
+        self.assertEqual(ab.read_new(s, st, parser)[0], ['old-2', 'old-3', 'new-1'])
+        with open(s.log, 'a', encoding='utf-8') as f:
+            f.write('new-2\n')
+        self.assertEqual(ab.read_new(s, st, parser)[0], ['new-2'])
 
 
 class Bans(Tmp):
@@ -292,6 +347,15 @@ class Daily(Tmp):
         who = quiet(ab.cmd_who, ab.Settings(conf), '198.51.100.7', 24)
         self.assertIn('За бота', who)
         self.assertIn('картинок и стилей 0', who)
+        # Mail.ru из сети VK — не кандидат, «настоящий поисковик»; без имени в DNS не из сети — «сверить сеть»
+        self.assertNotIn('95.163.33.18', out)
+        who = quiet(ab.cmd_who, ab.Settings(conf), '95.163.33.18', 24)
+        self.assertIn('Настоящий поисковик mailru: адрес из его сети', who)
+        self.assertIn('Вывод: настоящий поисковик — не трогать', who)
+        self.assertNotIn('DNS это не подтвердил', who)
+        quiet_one = bots.split('198.51.100.30', 1)[1].split('Разбор:', 1)[0]
+        self.assertIn('проверить нечем', quiet_one)
+        self.assertIn('сверить сеть', quiet_one)
 
 
 class Syntax(unittest.TestCase):

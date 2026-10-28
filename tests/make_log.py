@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Синтетический журнал nginx (combined) для проверки AntiBot. Только документационные адреса
-(192.0.2.x, 198.51.100.x, 203.0.113.x, 2001:db8::), плюс по одному адресу Cloudflare WARP и CDN.
+(192.0.2.x, 198.51.100.x, 203.0.113.x, 2001:db8::), плюс по одному адресу Cloudflare WARP и CDN
+и адрес робота Mail.ru из сети VK (у таких нет имени в DNS).
 
   python make_log.py > access.log          # три часа, начиная за три часа до сейчас
 """
@@ -10,6 +11,7 @@ import time
 CHROME = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
 IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7 Mobile/15E148 Safari/604.1'
 GOOGLEBOT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+MAILRU = 'Mozilla/5.0 (compatible; Linux x86_64; Mail.RU_Bot/Fast/2.0; +https://help.mail.ru/webmaster/indexing/robots)'
 
 # кто есть в журнале и чего от сторожа ждём (правило или None)
 EXPECT_CUSTOM = {
@@ -28,6 +30,9 @@ EXPECT_CUSTOM = {
     '2001:db8::7': 'parser',      # IPv6-парсер
     '203.0.113.50': 'scan',       # POST на wp-login.php — на «своём» движке это пробы
     '192.0.2.77': None,           # телефон, браузер шлёт HEAD перед каждой страницей, но грузит картинки
+    '95.163.33.18': None,         # настоящий Mail.ru: имени в DNS нет, адрес из сети VK
+    '198.51.100.30': None,        # «Mail.ru» без имени в DNS не из сети VK — проверить нечем, но не подделка
+    '198.51.100.31': 'parser',    # то же имя, но выкачивает каталог — правила для всех действуют
 }
 EXPECT_WOO = dict(EXPECT_CUSTOM, **{'192.0.2.40': None,    # на WooCommerce это свои пути
                                     '203.0.113.50': 'login'})  # подбор пароля
@@ -69,6 +74,13 @@ def build(start):
         a(line('198.51.100.20', start + 2000 + i * 20, 'GET', '/product/item-%d' % i, ua=GOOGLEBOT))
     for i in range(200):
         a(line('192.0.2.66', start + 2000 + i * 10, 'GET', '/product/item-%d' % i, ua=GOOGLEBOT))
+    # Mail.ru: настоящий из сети VK и два без имени в DNS не из неё — тихий и парсер
+    for i in range(40):
+        a(line('95.163.33.18', start + 2100 + i * 60, 'GET', '/product/item-%d' % i, ua=MAILRU))
+    for i in range(30):
+        a(line('198.51.100.30', start + 2100 + i * 20, 'GET', '/product/item-%d' % i, ua=MAILRU))
+    for i in range(80):
+        a(line('198.51.100.31', start + 2100 + i * 30, 'GET', '/product/item-%d' % i, ua=MAILRU))
     # HEAD по товарам
     for i in range(25):
         a(line('203.0.113.30', start + 4000 + i * 10, 'HEAD', '/product/item-%d' % i, size=0))
