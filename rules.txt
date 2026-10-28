@@ -1,0 +1,296 @@
+# AntiBot — правила: пробы уязвимостей, движки сайтов, поисковики, ИИ-боты, пороги.
+# Файл обновляется вместе со сторожем. Свои изменения пишите не сюда, а в antibot.ini
+# (разделы [patterns], [thresholds], [ban_hours]) — там они переживут обновление.
+# Регулярные выражения — по одному на строку, строки одного ключа объединяются через «или».
+# {stem} — первая часть домена сайта (shop для shop.example).
+
+[meta]
+version = 2026.10.28
+
+[thresholds]
+# окно правил, минут
+window_min = 60
+# после первого запуска правила «без статики» молчат столько минут — истории ещё нет
+warmup_min = 60
+# проб уязвимостей за час — сканер; одна SQL-инъекция сразу даёт столько же
+scan_hits = 3
+# страниц каталога за 5 минут / динамических запросов за 5 минут — «слишком часто»
+rate_pages_5 = 300
+rate_dyn_5 = 600
+# ответов 403/429 от самого сайта за час — «долбит отказы» (капча, своя защита сайта)
+refusals_hour = 30
+# карточек товара за час без картинок, стилей, скриптов страницы и POST — «парсер каталога»
+parser_products = 60
+# карточек товара за час без картинок и стилей, даже если скрипты работают — «безголовый браузер»
+headless_products = 300
+# страниц раздела с номером страницы не меньше pagination_min_page за час без картинок — «глубокая пагинация»
+pagination_pages = 30
+pagination_min_page = 5
+# HEAD-запросов к страницам за час — «HEAD по товарам» (люди HEAD не шлют)
+head_hits = 20
+# POST на вход в админку за час — «подбор пароля»
+login_posts = 20
+# назвался поисковиком, DNS не подтвердил, динамических запросов за час
+fake_se_dyn = 20
+# назвался ИИ-ботом, адрес не из списка его компании, запросов за час
+fake_ai_dyn = 300
+# ИИ-ботам пороги частоты выше во столько раз
+ai_factor = 4
+# работа над ошибками: сколько часов после бана смотреть, кто за адресом
+review_hours = 24
+# столько разных браузеров за адресом после бана — адрес общий (офис, NAT, мобильный оператор)
+shared_uas = 3
+# человек после бана не открывает больше стольких страниц
+human_max_pages = 30
+# доля страниц, на которых после бана сам набирал текст или работали скрипты, — «похоже, человек»
+typing_share = 0.3
+# после снятия «это человек» мягкие правила молчат столько часов
+grace_h = 6
+# повторы бана считаются за столько суток
+repeat_days = 30
+# тревоги
+heavy_pages = 3000
+heavy_dyn = 5000
+banned_flood = 20000
+wave_bans = 40
+flood_floor = 3000
+flood_factor = 3
+fake_se_alert = 500
+alert_repeat_h = 6
+alerts_per_day = 12
+mail_retry_min = 10
+mail_keep_h = 48
+# журнал не пополняется столько минут — письмо
+stale_min = 120
+# больше стольких настоящих автобанов за час — автобаны на час останавливаются (похоже на ошибку настройки)
+max_bans_hour = 200
+# адрес даёт такую долю запросов браузеров за час (при общем числе от proxy_min_req) и за ним
+# от proxy_uas разных браузеров — это прокси или CDN без real_ip, его не закрываем
+proxy_share = 0.2
+proxy_min_req = 500
+proxy_uas = 10
+
+[ban_hours]
+parser = 12
+headless = 12
+pagination = 12
+head = 12
+refusals = 24
+login = 24
+rate = 24
+fake_se = 168
+fake_ai = 168
+scan = 720
+manual = 24
+# повтор за repeat_days: второе попадание, третье и дальше
+repeat = 168 720
+# повторный скан с адреса, за которым не нашлось людей
+scan_repeat = 87600
+
+[policy]
+# эти правила закрывают по-настоящему и в режиме наблюдения: человек /.env и /.git не открывает
+enforce_always = scan
+# этим — обрыв соединения (444) вместо страницы с объяснением
+silent =
+
+[probe]
+# пробы, которые не бывают у людей ни на каком сайте (по пути без параметров)
+paths =
+    /\.(?:env|git|svn|hg|aws|ssh|ds_store|htpasswd)
+    (?:^|/)(?:backup|backups|dump|db|database|site|www|public_html|{stem})\.(?:zip|tar|tgz|tar\.gz|rar|7z|sql|sql\.gz)$
+    \.(?:sql|sql\.gz|bak|old|swp|save)$
+    /vendor/phpunit
+    eval-stdin
+    phpinfo\.php
+    ^/(?:cgi-bin/|actuator|server-status)
+    (?:^|/)(?:aws[_-]?(?:credentials|config)|azure(?:ad)?\.json|boto\.cfg|gcloud/|(?:service[_-]?account|credentials)\.json|secrets?\.(?:json|ya?ml))
+# пробы чужих движков (WordPress, phpMyAdmin, скрытые папки) — не считаются, если путь свой (own у движка или в настройках)
+cms =
+    ^/(?:wp-login\.php|xmlrpc\.php|wp-admin/|wp-content/(?:plugins|themes)/|wp-includes/|phpmyadmin|pma/|adminer)
+    ^/(?:[^/]+/)*(?:xmlrpc\.php|wp-login\.php|wp-admin/|wp-config\.php)
+    ^/(?:[^/]+/)*wp-json(?:/|$)
+    ^/(?:wp|wordpress)/$
+    ^/(?:[^/]+/)*\.(?!well-known/)[\w-]
+# то же параметром: /?rest_route=/…
+query =
+    ^/[^?]*\?(?:[^#]*&)?rest_route=
+traversal =
+    \.\./
+    %2e%2e
+    /etc/passwd
+# SQL-инъекция в параметрах — по раскодированной строке запроса; одна такая — уже сканер
+sqli =
+    \bunion\b[\s(/*+]+(?:all[\s(/*+]+|distinct[\s(/*+]+)?select\b
+    \b(?:extractvalue|updatexml)\s*\(
+    \b(?:sleep|pg_sleep)\s*\(\s*\d
+    \bbenchmark\s*\(\s*\d
+    \bwaitfor\s+delay\b
+    \border\s+by\s+\d+\s*(?:--|#|/\*)
+    ['"]\s*\)*\s*(?:and|or)\s+\(*\s*['"]?\w+['"]?\s*(?:=|<|>|like\b)
+    \binformation_schema\b
+    \bconcat(?:_ws)?\s*\(\s*0x
+    @@version\b
+    \bselect\b[^&]{0,60}\bfrom\b[^&]{0,60}\b(?:where|dual|limit)\b
+    [;]\s*(?:drop|truncate|alter)\s+table\b
+    \bload_file\s*\(
+    \binto\s+(?:out|dump)file\b
+# служебный файл отдан с кодом 200 — тревога «утечка»
+leak =
+    /\.(?:env|git/config|git/head|htpasswd|aws/credentials)
+    (?:^|/)(?:backup|backups|dump|db|database|site|www|public_html|{stem})\.(?:zip|tar|tgz|tar\.gz|rar|7z|sql|sql\.gz)$
+    \.sql(?:\.gz)?$
+    /etc/passwd
+    phpinfo\.php
+    (?:db_config|config|wp-config|settings|configuration)\.php\.(?:bak|old|save|orig|txt|swp)
+
+[static]
+# картинки, стили, скрипты, шрифты — по расширению пути
+ext =
+    \.(?:css|js|mjs|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|otf|eot|ico|mp4|webm)$
+
+[pages]
+# обычные страницы сайта: по ним считаются «другие браузеры за адресом» и «пришёл из поиска».
+# Сюда же — статика и шаблоны товара, раздела и поиска движка
+generic =
+    ^/$
+    ^/[^.?]*$
+    \.html?$
+    ^/(?:robots\.txt|favicon\.ico|sitemap[\w.-]*\.xml|apple-touch-icon[\w.-]*\.png)$
+
+[ua]
+# программы и роботы, которые не назвались поисковиком или ИИ-ботом
+bot =
+    bot|crawl|spider|slurp|curl|wget|python|go-http|java/|okhttp|axios|scrapy|httpclient|libwww|php|guzzle
+    headless|phantom|selenium|puppeteer|playwright
+browser =
+    Gecko|WebKit|Chrome|Safari|Firefox|Opera|Edg|CFNetwork
+
+[search_engines]
+# роботы Яндекса пишут «compatible; Yandex…» или «yandex.com/bots»; просто «yandex» в имени есть
+# у приложения Яндекса на телефоне — это человек
+yandex = compatible; ?ya|yandex\.com/bots|yandex\w*bot
+google = googlebot|google-inspectiontool|googleother|adsbot-google|storebot-google|mediapartners-google|google-read-aloud|apis-google|feedfetcher-google|google-site-verification|google-pagerenderer|privacy preserving prefetch proxy
+bing = bingbot|msnbot|bingpreview|adidxbot
+mailru = mail\.ru_bot
+
+[se_domains]
+yandex = .yandex.ru .yandex.net .yandex.com
+# без .googleusercontent.com: такое имя у любой арендованной машины Google Cloud
+google = .googlebot.com .google.com
+bing = .search.msn.com
+mailru = .mail.ru
+
+[ai_bots]
+# подстрока имени — компания
+list =
+    gptbot openai
+    oai-searchbot openai
+    chatgpt-user openai
+    claudebot anthropic
+    claude-user anthropic
+    claude-searchbot anthropic
+    anthropic-ai anthropic
+    perplexitybot perplexity
+    perplexity-user perplexity
+    bytespider bytedance
+    ccbot commoncrawl
+    amazonbot amazon
+    applebot apple
+    meta-externalagent meta
+    meta-externalfetcher meta
+    facebookbot meta
+    petalbot huawei
+    duckassistbot duckduckgo
+    duckduckbot duckduckgo
+    cohere-ai cohere
+    mistralai-user mistral
+    deepseek deepseek
+    youbot you
+    timpibot timpi
+
+[ai_rdns]
+apple = .applebot.apple.com
+amazon = .crawl.amazonbot.amazon
+
+[ai_lists]
+# опубликованные списки адресов компаний — скачиваются раз в сутки (выключается в настройках: ai_lists = no)
+openai = https://openai.com/searchbot.json https://openai.com/gptbot.json https://openai.com/chatgpt-user.json
+perplexity = https://www.perplexity.ai/perplexitybot.json https://www.perplexity.ai/perplexity-user.json
+
+[referer]
+# пришёл из поиска — признак человека (только на обычную страницу: сканеры подделывают Referer)
+search = ^https?://(?:www\.)?(?:yandex\.[a-z.]+|ya\.ru|google\.[a-z.]+|bing\.com|go\.mail\.ru|duckduckgo\.com|nova\.rambler\.ru|search\.yahoo\.com)(?:/|$)
+
+[nets]
+# общие адреса людей: Cloudflare WARP (приложение 1.1.1.1) — за пробы не закрываем, пробы и так получают отказ
+shared =
+    104.28.0.0/16
+    2a09:bac0::/29
+# адреса CDN Cloudflare: если сайт за Cloudflare без real_ip, через них идут все посетители — не закрываем никогда
+cdn =
+    173.245.48.0/20
+    103.21.244.0/22
+    103.22.200.0/22
+    103.31.4.0/22
+    141.101.64.0/18
+    108.162.192.0/18
+    190.93.240.0/20
+    188.114.96.0/20
+    197.234.240.0/22
+    198.41.128.0/17
+    162.158.0.0/15
+    104.16.0.0/13
+    104.24.0.0/14
+    172.64.0.0/13
+    131.0.72.0/22
+    2400:cb00::/32
+    2606:4700::/32
+    2803:f800::/32
+    2405:b500::/32
+    2405:8100::/32
+    2a06:98c0::/29
+    2c0f:f248::/32
+
+# ---------------------------------------------------------------- движки
+# product — карточка товара, catalog — раздел, search — поиск по сайту, page — номер страницы (первая группа),
+# js — запрос, который шлёт скрипт страницы (признак браузера), typing — подсказки при наборе текста,
+# login — вход в админку (POST), own — свои служебные пути (не пробы), static — статика без расширения.
+# Пустой product — карточкой считается любая обычная страница.
+
+[engine:custom]
+page = [?&](?:page|p|PAGEN_\d+)=(\d+)|/page[/-]?(\d+)/?$
+js = [?&](?:ajax|_rsc|bxajaxid|wc-ajax)=|/ajax(?:/|\.php)|admin-ajax\.php
+
+[engine:nextjs]
+page = [?&]page=(\d+)
+js = [?&]_rsc=|^/_next/data/
+own = ^/_next/
+static = ^/_next/(?:static|image)(?:/|\?|$)
+
+[engine:bitrix]
+search = ^/(?:search|catalog)/?(?:index\.php)?\?(?:.*&)?q=
+page = [?&]PAGEN_\d+=(\d+)
+js = [?&](?:bxajaxid|ajax_call|ajax_mode)=|^/bitrix/(?:services|tools|components)/
+typing = ^/bitrix/components/bitrix/search\.title/|[?&]ajax_call=y
+login = ^/bitrix/admin/|[?&]login=yes
+own = ^/(?:bitrix|local|upload)/
+static = ^/upload/
+
+[engine:opencart]
+product = [?&]route=product/product\b
+catalog = [?&]route=product/(?:category|manufacturer)\b
+search = [?&]route=product/search\b
+page = [?&]page=(\d+)
+js = [?&]route=(?:common/cart/info|checkout/cart/add|extension/)
+login = ^/admin/(?:index\.php)?(?:\?|$)|[?&]route=account/login\b
+own = ^/(?:admin|image|catalog/view)/
+
+[engine:woocommerce]
+product = ^/product/[^/?]+/?$
+catalog = ^/product-(?:category|tag)/
+search = [?&]s=[^&]*&(?:.*&)?post_type=product|[?&]post_type=product&(?:.*&)?s=
+page = /page/(\d+)/?
+js = [?&]wc-ajax=|^/wp-admin/admin-ajax\.php|^/wp-json/wc/store/
+login = ^/wp-login\.php|^/xmlrpc\.php
+own = ^/wp-(?:admin|content|includes|json)/|^/wp-(?:login|cron)\.php|^/xmlrpc\.php|[?&]rest_route=
+static = ^/wp-content/uploads/
