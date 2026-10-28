@@ -264,6 +264,60 @@ class Replay(Tmp):
         self.check('woocommerce', make_log.EXPECT_WOO)
 
 
+class Review(Tmp):
+    UAS = ['Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 '
+           'Safari/537.36',
+           'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+           'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 '
+           'Safari/537.36',
+           'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0',
+           'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile '
+           'Safari/537.36']
+
+    def test_rotation_shared_and_soft_scan(self):
+        """Сканер со сменой имени браузера — не «общий адрес»; люди за NAT с картинками — общий; «закрыл бы» по
+        мягкому правилу не прикрывает сканера от настоящего бана."""
+        start = calendar.timegm((2026, 10, 20, 8, 0, 0))
+        L, U = make_log.line, self.UAS
+        lines = []
+        # сканер: три пробы — бан scan; потом сутки с лишним заходит на главную, вход и регистрацию под пятью именами
+        for j, u in enumerate(('/.env', '/wp-login.php', '/.git/config')):
+            lines.append(L('198.51.100.41', start + j * 20, 'GET', u, status=404, ua='curl/8.0'))
+        for k in range(20):
+            t, ua = start + 600 + k * 80 * 60, U[k % 5]
+            lines.append(L('198.51.100.41', t, 'GET', '/', status=403, ua=ua))
+            lines.append(L('198.51.100.41', t + 5, 'GET', '/login', status=403, ua=ua))
+            lines.append(L('198.51.100.41', t + 9, 'POST', '/register', status=403, ua=ua))
+        # NAT: парсер под одним именем, после «закрыл бы» — трое людей с картинками и значком
+        for i in range(70):
+            lines.append(L('198.51.100.42', start + i * 25, 'GET', '/catalog/item-%d' % i, ua='python-requests/2.31'))
+        for k, ua in enumerate(U[:3]):
+            t = start + 2400 + k * 300
+            lines.append(L('198.51.100.42', t, 'GET', '/catalog/phones/', ua=ua))
+            lines.append(L('198.51.100.42', t + 1, 'GET', '/img/a.png', ua=ua))
+            lines.append(L('198.51.100.42', t + 2, 'GET', '/favicon.ico', ua=ua))
+            lines.append(L('198.51.100.42', t + 40, 'GET', '/catalog/phones/item-%d' % k, ua=ua))
+        # сканер за своей проверкой сайта: 403 — «долбит отказы» («закрыл бы»), потом пробы под новыми именами
+        for i in range(35):
+            lines.append(L('198.51.100.40', start + i * 60, 'GET', '/catalog/a-%d' % i, status=403, ua=U[0]))
+        for j, u in enumerate(('/.env', '/wp-login.php', '/.git/config')):
+            lines.append(L('198.51.100.40', start + 2400 + j * 30, 'GET', u, status=404, ua=U[j + 1]))
+        lines.append(L('203.0.113.200', start + 27 * 3600, 'GET', '/', ua=U[0]))     # журнал идёт дальше суток
+        log = os.path.join(self.d, 'access.log')
+        with open(log, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(l for _, l in sorted(lines)) + '\n')
+        s = ab.Settings(write_conf(self.d), os.path.join(self.d, 'replay'))
+        quiet(ab.cmd_replay, s, [log])
+        db = sqlite3.connect(os.path.join(self.d, 'replay', 'antibot.sqlite3'))
+        verdict = {ip: (rule, v) for ip, rule, v in db.execute('SELECT ip, rule, verdict FROM review_log ORDER BY id')}
+        self.assertEqual(verdict['198.51.100.41'], ('scan', 'bot'))
+        ev = db.execute("SELECT evidence FROM review_log WHERE ip='198.51.100.41'").fetchone()[0]
+        self.assertIn('имён браузера без единой картинки и скрипта — 5', ev)
+        self.assertEqual(verdict['198.51.100.42'], ('parser', 'shared'))
+        bans = list(db.execute("SELECT rule, enforced FROM ban_log WHERE ip='198.51.100.40' ORDER BY id"))
+        self.assertEqual(bans, [('refusals', 0), ('scan', 1)])
+
+
 class Rotation(Tmp):
     def test_dateext_tail(self):
         """После ротации с датой (logrotate dateext) хвост прежнего файла дочитывается."""

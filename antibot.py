@@ -27,7 +27,7 @@
 Режимы: observe — «закрыл бы» в базу, по-настоящему закрывает только правила из enforce_always (сканеры);
 enforce — закрывает всех; report — никого не закрывает и nginx не трогает. MAIL_DRY=1 — письма в консоль.
 """
-VERSION = '0.1.2'
+VERSION = '0.1.3'
 
 import calendar, collections, configparser, glob, gzip, html, ipaddress, json, os, pickle, re
 import shlex, smtplib, socket, sqlite3, subprocess, sys, threading, time, traceback, urllib.parse, urllib.request
@@ -52,6 +52,7 @@ LOG_FORMATS = {
 }
 MAX_READ = 64 << 20                      # за один проход — не больше 64 МБ журнала
 PROBE_KEY = '_probe'                     # в review.uas: имена браузеров, под которыми адрес делал пробы
+HUMAN_KEY = '_human'                     # в review.uas: имена, под которыми после бана грузили статику, скрипты, значок
 PLAIN_PAGE = re.compile(r'^/(?:[^.?]*|[^?]*\.html?)$', re.I)
 BASE_ALLOW = ['127.0.0.0/8', '::1/128', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', 'fc00::/7', 'fe80::/10']
 
@@ -993,7 +994,12 @@ class Guard:
         self.leaks = []
         self.max_min = None
         self.enforced_mode = self.s.mode() == 'enforce'
-        self.banned_now = {r[0]: r[1] for r in self.st.q('SELECT ip, kind FROM bans WHERE until > ?', (now(),))}
+        bans = self.st.q('SELECT ip, kind, rule FROM bans WHERE until > ?', (now(),)).fetchall()
+        self.banned_now = {r[0]: r[1] for r in bans}
+        # «закрыл бы» по мягкому правилу: пробы с такого адреса считаем дальше, чтобы сканер получил настоящий бан
+        always = self.s.policy('enforce_always')
+        self.soft = {r[0] for r in bans if not r[1] and r[2] not in always and r[2] != 'manual'} \
+            if 'scan' in always and self.s.mode() != 'report' else set()
 
     # --- окна
     def _bucket(self, ip, minute):
@@ -1086,12 +1092,13 @@ class Guard:
             self.ban_hits[ip] += 1
             self.dly['banned_hits'] += 1
             v = self.rv.setdefault(ip, {'hits': 0, 'pages': 0, 'uas': collections.Counter(), 'se_ref': 0,
-                                        'favicon': 0, 'st': 0, 'sg': 0, 'post': 0, 'js': 0})
+                                        'favicon': 0, 'st': 0, 'sg': 0, 'post': 0, 'js': 0, 'hu': set()})
             v['hits'] += 1
             if r.ua_class(ua)[0] == 'br' and page:
                 v['uas'][ua[:150]] += 1
             if se_page:
                 v['se_ref'] += 1                              # пришёл из поиска — так ходят люди
+            human = True                                      # под этим именем страница показывалась как в браузере
             if path == '/favicon.ico' or path.startswith('/apple-touch-icon'):
                 v['favicon'] += 1                             # браузер показал страницу и просит значок
             elif is_static:
@@ -1100,10 +1107,21 @@ class Guard:
                 v['sg'] += 1
             elif meth == 'POST':
                 v['post'] += 1
+                human = False                                 # POST на вход и регистрацию шлют и сканеры
             elif r.js and r.js.search(url):
                 v['js'] += 1
-            elif r.is_product(path, url) or (r.catalog and r.catalog.search(url)) or (r.search and r.search.search(url)):
-                v['pages'] += 1
+            else:
+                human = False
+                if r.is_product(path, url) or (r.catalog and r.catalog.search(url)) or (r.search and r.search.search(url)):
+                    v['pages'] += 1
+            if human:
+                v['hu'].add(ua[:150])
+            if ip in self.soft and (sqli or hit):
+                n = self.s.th('scan_hits') if sqli else 1
+                b[SC] += n
+                h[SC] += n
+                self.active[ip] += 1
+                S['UA'][ip] = (ua[:300],) + r.ua_class(ua) + (minute,)
             return
         cls, fam = r.ua_class(ua)
         S['UA'][ip] = (ua[:300], cls, fam, minute)
@@ -1184,11 +1202,14 @@ class Guard:
                 continue
             saved = json.loads(row[0] or '{}') or {}
             pu = set(saved.pop(PROBE_KEY, [])) | set(S['PU'].get(ip, ()))
+            hu = set(saved.pop(HUMAN_KEY, [])) | v['hu']
             uas = collections.Counter(saved)
             uas.update(v['uas'])
             uas = dict(uas.most_common(20))
             if pu:
                 uas[PROBE_KEY] = sorted(pu)[:20]
+            if hu:
+                uas[HUMAN_KEY] = sorted(hu)[:40]
             st.q('UPDATE review SET hits=hits+?, pages=pages+?, uas=?, se_ref=se_ref+?, favicon=favicon+?, st=st+?, '
                  'sg=sg+?, post=post+?, js=js+? WHERE ip=?',
                  (v['hits'], v['pages'], json.dumps(uas, ensure_ascii=False), v['se_ref'], v['favicon'], v['st'],
@@ -1227,8 +1248,14 @@ class Guard:
         new_bans = []
         th = s.th
         for ip in self.active:
-            if ip in self.banned_now or ip not in UA:
+            if ip not in UA:
                 continue
+            upgrade = False
+            if ip in self.banned_now:
+                # «закрыл бы» правила до конца срока не пересчитывают — кроме проб: набрал порог — настоящий бан сканеру
+                if ip not in self.soft or S['W'][ip][1][SC] < th('scan_hits') or ip in r.shared:
+                    continue
+                upgrade = True
             ua, cls, fam, _ = UA[ip]
             h = S['W'][ip][1]
             f5 = self._sum5(ip, now_min)
@@ -1241,7 +1268,11 @@ class Guard:
             soft_ok = ip not in grace
             shared = ip in r.shared
             rule = None
-            if cls == 'se':
+            if upgrade:
+                if cls in ('se', 'ai') and ver.status(ip, cls, fam) == 1:
+                    continue
+                rule = 'scan'
+            elif cls == 'se':
                 vs = ver.status(ip, cls, fam)
                 if vs == 1:
                     continue
@@ -1526,9 +1557,13 @@ def review_pass(s, store, ver, allow, mailer, enforced_mode):
     for ip, rule, since, hits, pages, uas, bot_ua, se_ref, fav, st_, sg, post, js, hb, rdns, rdns_ok in rows:
         uas = json.loads(uas or '{}') or {}
         probe_uas = set(uas.pop(PROBE_KEY, []))
-        # другие браузеры за адресом: не тот UA, под которым шёл бот, и запросов мало — так выглядят люди за NAT.
-        # Имя, под которым адрес делал пробы, — сам сканер.
-        others = [u for u, n in uas.items() if u != (bot_ua or '')[:150] and u not in probe_uas and n <= 20]
+        human_uas = set(uas.pop(HUMAN_KEY, []))
+        # другие браузеры за адресом: не тот UA, под которым шёл бот, запросов мало и под этим именем грузили
+        # картинки, стили, скрипты страницы или значок — так выглядят люди за NAT. Имя, под которым адрес делал
+        # пробы, — сам сканер; имя без единой картинки и скрипта — программа меняет имя браузера.
+        new = [u for u, n in uas.items() if u != (bot_ua or '')[:150] and u not in probe_uas and n <= 20]
+        others = [u for u in new if u in human_uas]
+        rotated = len(new) - len(others)
         in_list = ver.in_lists(ip, bot_ua)
         ev = []
         if hits:
@@ -1536,7 +1571,10 @@ def review_pass(s, store, ver, allow, mailer, enforced_mode):
         if se_ref:
             ev.append('%d раз пришли на адрес из поиска' % se_ref)
         if others:
-            ev.append('другие браузеры за адресом, по нескольку запросов — %d' % len(others))
+            ev.append('другие браузеры за адресом, по нескольку запросов, с картинками или скриптами — %d' % len(others))
+        if rotated >= th('shared_uas') - 1:
+            ev.append('имён браузера без единой картинки и скрипта — %d: так меняет имя программа, а не люди за '
+                      'одним адресом' % rotated)
         if hb:
             ev.append('за сутки до бана на этот адрес приходили из поиска')
         if sg or post or st_ or fav or js:
