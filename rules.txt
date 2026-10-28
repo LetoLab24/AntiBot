@@ -5,7 +5,7 @@
 # {stem} — первая часть домена сайта (shop для shop.example).
 
 [meta]
-version = 2026.10.28.1
+version = 2026.10.28.2
 
 [thresholds]
 # окно правил, минут
@@ -134,14 +134,16 @@ sqli =
     [;]\s*(?:drop|truncate|alter)\s+table\b
     \bload_file\s*\(
     \binto\s+(?:out|dump)file\b
-# служебный файл отдан с кодом 200 — тревога «утечка»
+# служебный файл отдан с кодом 200 — тревога «утечка». Только по концу пути: /auth/.env/ — это страница сайта,
+# а не файл. Адреса, на которые движок отвечает 200 страницей входа, — в leak_exclude у движка
 leak =
-    /\.(?:env|git/config|git/head|htpasswd|aws/credentials)
+    /\.env(?:\.[\w-]+)*$
+    /\.(?:git/config|git/head|htpasswd|aws/credentials)$
     (?:^|/)(?:backup|backups|dump|db|database|site|www|public_html|{stem})\.(?:zip|tar|tgz|tar\.gz|rar|7z|sql|sql\.gz)$
     \.sql(?:\.gz)?$
-    /etc/passwd
-    phpinfo\.php
-    (?:db_config|config|wp-config|settings|configuration)\.php\.(?:bak|old|save|orig|txt|swp)
+    /etc/passwd$
+    phpinfo\.php$
+    (?:db_config|config|wp-config|settings|configuration)\.php\.(?:bak|old|save|orig|txt|swp)$
 
 [static]
 # картинки, стили, скрипты, шрифты — по расширению пути
@@ -261,7 +263,8 @@ cdn =
 # ---------------------------------------------------------------- движки
 # product — карточка товара, catalog — раздел, search — поиск по сайту, page — номер страницы (первая группа),
 # js — запрос, который шлёт скрипт страницы (признак браузера), typing — подсказки при наборе текста,
-# login — вход в админку (POST), own — свои служебные пути (не пробы), static — статика без расширения.
+# login — вход в админку (POST), own — свои служебные пути (не пробы), static — статика без расширения,
+# leak_exclude — адреса, на которые движок отвечает 200 своей страницей (вход, своя 404): «утечки» там не бывает.
 # Пустой product — карточкой считается любая обычная страница.
 
 [engine:custom]
@@ -282,6 +285,7 @@ typing = ^/bitrix/components/bitrix/search\.title/|[?&]ajax_call=y
 login = ^/bitrix/admin/|[?&]login=yes
 own = ^/(?:bitrix|local|upload)/
 static = ^/upload/
+leak_exclude = ^/bitrix/admin/|^/auth/
 
 [engine:opencart]
 product = [?&]route=product/product\b

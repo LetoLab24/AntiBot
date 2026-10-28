@@ -123,6 +123,27 @@ class Patterns(Tmp):
         self.assertEqual(r.page_number('/catalog/cases/?PAGEN_1=12'), 12)
         self.assertTrue(r.js.search('/catalog/?bxajaxid=abc'))
 
+    def test_leak(self):
+        r = self.rules('custom')
+        for u in ('/.env', '/.env.local', '/.env.production', '/app/.env', '/.git/config', '/.git/HEAD', '/.htpasswd',
+                  '/.aws/credentials', '/phpinfo.php', '/backup.zip', '/shop.sql.gz', '/config.php.bak'):
+            self.assertTrue(r.leak.search(u), u)
+        for u in ('/auth/.env/', '/.env/', '/.envrc', '/phpinfo.php/x', '/.git/config/', '/catalog/', '/info.php'):
+            self.assertFalse(r.leak.search(u), u)
+        self.assertIsNone(r.leak_exclude)
+        # Битрикс отвечает 200 страницей входа на /bitrix/admin/* и на всё внутри /auth/
+        b = self.rules('bitrix')
+        for u in ('/bitrix/admin/phpinfo.php', '/auth/.env'):
+            self.assertTrue(b.leak.search(u) and b.leak_exclude.search(u), u)
+        self.assertFalse(b.leak_exclude.search('/.env'))
+        # свои исключения: _extra добавляет к набору движка, ключ без _extra — заменяет набор
+        add = ab.Rules(ab.Settings(write_conf(self.d, 'bitrix', '[patterns]\nleak_exclude_extra = ^/login/\n')))
+        for u in ('/login/.env', '/auth/.env', '/bitrix/admin/phpinfo.php'):
+            self.assertTrue(add.leak_exclude.search(u), u)
+        own = ab.Rules(ab.Settings(write_conf(self.d, 'bitrix', '[patterns]\nleak_exclude = ^/login/\n')))
+        self.assertTrue(own.leak_exclude.search('/login/.env'))
+        self.assertFalse(own.leak_exclude.search('/auth/.env'))
+
     def test_nextjs(self):
         r = self.rules('nextjs')
         self.assertTrue(r.is_static('/_next/image'))
@@ -261,6 +282,30 @@ class Rotation(Tmp):
         with open(s.log, 'a', encoding='utf-8') as f:
             f.write('new-2\n')
         self.assertEqual(ab.read_new(s, st, parser)[0], ['new-2'])
+
+    def test_long_tail(self):
+        """Хвост прежнего файла больше MAX_READ: дочитываем его за несколько проходов, потом — новый файл."""
+        s = ab.Settings(write_conf(self.d))
+        st = ab.Store(s.state_dir)
+        parser = ab.LogParser(s)
+        open(s.log, 'w').close()
+        ab.read_new(s, st, parser)
+        with open(s.log, 'ab') as f:
+            f.write(b''.join(b'old-%02d\n' % i for i in range(10)))     # 10 строк по 7 байт
+        os.rename(s.log, s.log + '.1')
+        with open(s.log, 'w', encoding='utf-8') as f:
+            f.write('new-1\n')
+        saved = ab.MAX_READ
+        ab.MAX_READ = 30
+        try:
+            got = []
+            for _ in range(5):
+                got.append(ab.read_new(s, st, parser)[0])
+        finally:
+            ab.MAX_READ = saved
+        self.assertEqual(got[0], ['old-00', 'old-01', 'old-02', 'old-03'])
+        self.assertEqual(sum(got, []), ['old-%02d' % i for i in range(10)] + ['new-1'])
+        self.assertEqual(got[-1], [])
 
 
 class Bans(Tmp):

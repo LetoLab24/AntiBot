@@ -27,7 +27,7 @@
 Режимы: observe — «закрыл бы» в базу, по-настоящему закрывает только правила из enforce_always (сканеры);
 enforce — закрывает всех; report — никого не закрывает и nginx не трогает. MAIL_DRY=1 — письма в консоль.
 """
-VERSION = '0.1.1'
+VERSION = '0.1.2'
 
 import calendar, collections, configparser, glob, gzip, html, ipaddress, json, os, pickle, re
 import shlex, smtplib, socket, sqlite3, subprocess, sys, threading, time, traceback, urllib.parse, urllib.request
@@ -284,7 +284,7 @@ class Rules:
         self.traversal = _rx(lines('probe', 'traversal'))
         self.sqli = _rx(lines('probe', 'sqli'))
         self.leak = _rx(lines('probe', 'leak'))
-        self.leak_exclude = _rx(_lines(s.get('patterns', 'leak_exclude')))
+        self.leak_exclude = _rx(_lines(s.pattern('leak_exclude')))
         self.static = _rx(lines('static', 'ext') + _lines(s.pattern('static')))
         self.own = _rx(_lines(s.pattern('own')))
         self.product = _rx(_lines(s.pattern('product')))
@@ -1387,7 +1387,10 @@ class Guard:
             self.mail.send('ВНИМАНИЕ, сайт отдал служебный файл',
                            'Коротко: на запрос %s с адреса %s сайт ответил кодом 200 и отдал %s байт. Такие файлы '
                            '(резервные копии, .env, дампы базы) не должны открываться снаружи. Нужно проверить сегодня: '
-                           'что это за файл и нет ли в нём паролей.\n\nUA: %s' % (url, ip, size, ua),
+                           'что это за файл и нет ли в нём паролей.\n\nЕсли по этому адресу сайт отдаёт свою страницу '
+                           '(вход, «страница не найдена»), а не файл, — тревога ложная. Чтобы она не повторялась, '
+                           'добавьте начало пути в %s, раздел [patterns], ключ leak_exclude_extra '
+                           '(например, ^/auth/).\n\nUA: %s' % (url, ip, size, self.s.path, ua),
                            key='leak:' + url, repeat_h=24)
 
     def breaker(self):
@@ -1637,7 +1640,8 @@ def read_new(s, store, parser):
     off = pos.get('off', 0)
     if pos.get('ino') != stt.st_ino:
         # журнал повернули: дочитать хвост прежнего файла, потом новый с начала. Прежний файл ищем по inode:
-        # access.log.1 или с датой (logrotate dateext: access.log-20261028), без сжатия
+        # access.log.1 или с датой (logrotate dateext: access.log-20261028), без сжатия. Хвост больше MAX_READ —
+        # остаёмся на прежнем файле до следующего прохода, к новому переходим, когда прежний дочитан
         olds = [s.log + '.1'] + [f for f in sorted(glob.glob(s.log_archives), reverse=True) if not f.endswith('.gz')]
         for old in olds:
             try:
@@ -1646,6 +1650,12 @@ def read_new(s, store, parser):
                 with open(old, 'rb') as f:
                     f.seek(off)
                     chunk = f.read(MAX_READ)
+                    more = bool(f.read(1))
+                if more:
+                    cut = chunk.rfind(b'\n') + 1 or len(chunk)
+                    store.set_meta('pos', json.dumps({'ino': pos['ino'], 'off': off + cut}))
+                    store.set_meta('last_data', now())
+                    return chunk[:cut].decode('utf-8', 'replace').splitlines(), ''
                 lines += chunk.decode('utf-8', 'replace').splitlines()
                 break
             except OSError:
