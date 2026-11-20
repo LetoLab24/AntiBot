@@ -5,7 +5,7 @@
 # {stem} — первая часть домена сайта (shop для shop.example).
 
 [meta]
-version = 2026.10.28.2
+version = 2026.11.20.1
 
 [thresholds]
 # окно правил, минут
@@ -28,6 +28,20 @@ pagination_pages = 30
 pagination_min_page = 5
 # HEAD-запросов к страницам за час — «HEAD по товарам» (люди HEAD не шлют)
 head_hits = 20
+# «без скриптов»: под именем обычного браузера столько страниц каталога за час без картинок, скриптов страницы,
+# подсказок и POST, и за сутки адрес ни разу не грузил картинки и не приходил из поиска. Так ходят пулы выгрузки
+# с домашних и мобильных прокси. Правило молчит, если картинки сайта почти не видны в журнале (их отдаёт CDN):
+# у браузеров за час статики должно быть не меньше nojs_static_share всех запросов
+nojs_pages = 20
+nojs_static_share = 0.1
+# столько банов «без скриптов» за час — письмо «пул без скриптов»
+nojs_wave = 5
+# подтверждённый бот: после «закрыл бы» за review_hours не меньше стольких запросов и ни одного признака человека
+confirm_hits = 20
+# пул разовых адресов: за час с одним именем браузера столько адресов, у каждого 1–pool_max_pages страниц каталога
+# и ни картинок, ни скриптов, — письмо (адреса с этим именем, которые грузили картинки, должны быть меньшинством)
+pool_ips = 60
+pool_max_pages = 6
 # POST на вход в админку за час — «подбор пароля»
 login_posts = 20
 # назвался поисковиком, DNS не подтвердил, динамических запросов за час
@@ -57,7 +71,9 @@ flood_floor = 3000
 flood_factor = 3
 fake_se_alert = 500
 alert_repeat_h = 6
+# писем в сутки: «работа над ошибками» / остальные тревоги — пределы отдельные
 alerts_per_day = 12
+alerts_all_per_day = 50
 mail_retry_min = 10
 mail_keep_h = 48
 # журнал не пополняется столько минут — письмо
@@ -69,8 +85,15 @@ max_bans_hour = 200
 proxy_share = 0.2
 proxy_min_req = 500
 proxy_uas = 10
+# нагрузка сервера: средняя за 5 минут выше load_max (0 — по числу ядер процессора) дольше load_min минут — письмо
+load_max = 0
+load_min = 10
 
 [ban_hours]
+# «без скриптов» — коротко и без удлинения при повторе: домашние адреса пула потом достаются людям
+nojs = 3
+# подтверждённый бот: первый бан, повтор за repeat_days — по лестнице repeat
+confirmed = 168
 parser = 12
 headless = 12
 pagination = 12
@@ -88,8 +111,12 @@ repeat = 168 720
 scan_repeat = 87600
 
 [policy]
-# эти правила закрывают по-настоящему и в режиме наблюдения: человек /.env и /.git не открывает
-enforce_always = scan
+# эти правила закрывают по-настоящему и в режиме наблюдения:
+#   scan — человек /.env и /.git не открывает;
+#   confirmed — бот подтвердился за сутки наблюдения (ни одного признака человека);
+#   nojs — пул без скриптов, бан на 3 часа.
+# Вернуть прежнее «закрывает только сканеров»: antibot.ini, раздел [site], enforce_always = scan
+enforce_always = scan confirmed nojs
 # этим — обрыв соединения (444) вместо страницы с объяснением
 silent =
 
@@ -166,6 +193,17 @@ bot =
     headless|phantom|selenium|puppeteer|playwright
 browser =
     Gecko|WebKit|Chrome|Safari|Firefox|Opera|Edg|CFNetwork
+# подделанные имена браузеров — так настоящий браузер не подписывается. Только признак в сводке и письмах,
+# сам сторож по нему не закрывает:
+#   версия Chrome из двух чисел (Chrome/124.0 Safari/…) — настоящий пишет четыре (Chrome/124.0.0.0);
+#   AppleWebKit/537.36 без «(KHTML, like Gecko)»;
+#   имя оборвано после скобки (Mozilla/5.0 (Windows NT 10.0; Win64; x64));
+#   браузер без окна, назвавшийся сам
+fake =
+    Chrome/\d+\.0 (?:Mobile )?Safari/
+    AppleWebKit/537\.36(?! \(KHTML, like Gecko\))
+    ^Mozilla/5\.0 \((?!compatible)[^)]*\)$
+    HeadlessChrome
 
 [search_engines]
 # роботы Яндекса пишут «compatible; Yandex…» или «yandex.com/bots»; просто «yandex» в имени есть
@@ -282,7 +320,8 @@ search = ^/(?:search|catalog)/?(?:index\.php)?\?(?:.*&)?q=
 page = [?&]PAGEN_\d+=(\d+)
 js = [?&](?:bxajaxid|ajax_call|ajax_mode)=|^/bitrix/(?:services|tools|components)/
 typing = ^/bitrix/components/bitrix/search\.title/|[?&]ajax_call=y
-login = ^/bitrix/admin/|[?&]login=yes
+# только форма входа: сохранения в админке (POST в /bitrix/admin/*.php) — работа сотрудников, не подбор пароля
+login = ^/bitrix/admin/(?:index\.php)?(?:\?|$)|[?&]login=yes(?:&|$)
 own = ^/(?:bitrix|local|upload)/
 static = ^/upload/
 leak_exclude = ^/bitrix/admin/|^/auth/

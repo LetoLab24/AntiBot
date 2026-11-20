@@ -11,7 +11,9 @@
   antibot --daily [ЧАСОВ]                 сводка: что сделал сторож и кого стоит закрыть (по умолчанию 24 ч)
   antibot --who АДРЕС [ЧАСОВ]             что делал адрес
   antibot --ban АДРЕС ЧАСОВ [причина]     закрыть адрес (вручную)
-  antibot --unban АДРЕС                   снять бан
+  antibot --ban-net СЕТЬ ЧАСОВ [причина] [--force]
+                                          закрыть сеть целиком (облако); сначала проверит, нет ли в ней людей
+  antibot --unban АДРЕС|СЕТЬ              снять бан
   antibot --allow АДРЕС [кто это]         снять бан и внести в белый список
   antibot --block-ua "ИМЯ" [--force]      закрыть точное имя браузера (User-Agent) в nginx
   antibot --unblock-ua "ИМЯ"
@@ -24,10 +26,11 @@
   antibot --test-mail | --version
 
 Настройки — /etc/antibot/antibot.ini (или --config ФАЙЛ). Правила — rules.txt рядом со скриптом.
-Режимы: observe — «закрыл бы» в базу, по-настоящему закрывает только правила из enforce_always (сканеры);
-enforce — закрывает всех; report — никого не закрывает и nginx не трогает. MAIL_DRY=1 — письма в консоль.
+Режимы: observe — «закрыл бы» в базу, по-настоящему закрывает только правила из enforce_always (сканеры,
+подтверждённые боты, пулы без скриптов); enforce — закрывает всех; report — никого не закрывает и nginx не трогает.
+MAIL_DRY=1 — письма в консоль.
 """
-VERSION = '0.1.3'
+VERSION = '0.2.0'
 
 import calendar, collections, configparser, glob, gzip, html, ipaddress, json, os, pickle, re
 import shlex, smtplib, socket, sqlite3, subprocess, sys, threading, time, traceback, urllib.parse, urllib.request
@@ -63,8 +66,23 @@ NF = 15
 RULE_NAMES = {'scan': 'сканер уязвимостей', 'rate': 'слишком часто', 'refusals': 'долбит отказы (403/429)',
               'parser': 'парсер каталога', 'headless': 'безголовый браузер', 'pagination': 'глубокая пагинация',
               'head': 'HEAD по страницам', 'login': 'подбор пароля', 'fake_se': 'поддельный поисковик',
-              'fake_ai': 'поддельный ИИ-бот', 'manual': 'вручную'}
+              'fake_ai': 'поддельный ИИ-бот', 'manual': 'вручную', 'nojs': 'без скриптов (пул)',
+              'confirmed': 'бот подтверждён за сутки'}
 SOFT = {'parser', 'headless', 'pagination', 'head', 'refusals'}
+# «Без скриптов»: под именем обычного браузера страница за страницей, а картинок, скриптов страницы, подсказок и POST нет.
+# Так ходят пулы выгрузки с домашних и мобильных прокси. Программы, которые называют себя («compatible; …»), — мимо.
+NOJS_UA = re.compile(r'^Mozilla/5\.0 \((?!compatible)[^)]*\).*(?:Chrome/|Safari/|Firefox/)')
+# Подтверждённый бот: «закрыл бы» по этим правилам, а за сутки после — не меньше confirm_hits запросов и ни одного
+# признака человека. Поддельный поисковик и подбор пароля сюда не входят: первое при сбоях DNS у сервера заденет
+# настоящего робота, второе на Битриксе и WordPress задевает своих сотрудников.
+CONFIRM_RULES = {'parser', 'headless', 'pagination', 'head', 'refusals', 'rate', 'fake_ai'}
+# Нагрузка сервера: штатные причины, о которых письмо не нужно (резервная копия, обновление системы)
+LOAD_ROUTINE = [
+    ('резервная копия', re.compile(r'(?:^|/)(?:mysqldump|mariadb-dump|pg_dump|pg_dumpall|xtrabackup|mariabackup|borg|'
+                                   r'restic|duplicity|rsnapshot|bx-backup)\b|backup', re.I)),
+    ('обновление системы', re.compile(r'(?:^|/)(?:apt|apt-get|aptitude|dpkg|unattended-upgrade|yum|dnf|rpm|zypper)'
+                                      r'(?:\s|$)')),
+]
 RV_NAMES = {'good-bot': 'хороший бот', 'human': 'похоже, человек', 'shared': 'общий адрес: и бот, и люди',
             'bot': 'бот — подтвердилось', 'quiet': 'ушёл после бана', 'manual': 'снят вручную',
             'typing': 'похоже, человек: страница работала как в браузере'}
@@ -213,6 +231,8 @@ class Settings:
         self.ai_lists = self.flag('features', 'ai_lists', True) and not state_override
         self.auto_unban = self.flag('features', 'auto_unban_humans', True)
         self.never_ban_cdn = self.flag('features', 'never_ban_cdn', True)
+        self.block_headless = self.flag('features', 'block_headless', True)
+        self.load_watch = self.flag('features', 'load_watch', True) and not state_override
 
     def get(self, sec, key, default=''):
         v = self.site.get(sec, key, fallback=None)
@@ -299,6 +319,7 @@ class Rules:
         self.pages = _rx(pages)
         self.bot_ua = _rx(lines('ua', 'bot'))
         self.browser_ua = _rx(lines('ua', 'browser'), 0)
+        self.fake_ua = _rx(lines('ua', 'fake'), 0)
         self.se_ref = _rx(lines('referer', 'search'))
         self.se_ua = [(re.compile(v, re.I), fam) for fam, v in R.items('search_engines')
                       if fam not in R.defaults()]
@@ -316,6 +337,10 @@ class Rules:
 
     def is_static(self, path):
         return bool(self.static and self.static.search(path))
+
+    def is_fake(self, ua):
+        """Имя браузера, которым настоящий браузер не подписывается (версия Chrome из двух чисел, обрезанное имя)."""
+        return bool(ua and self.fake_ua and self.fake_ua.search(ua))
 
     def is_sqli(self, url):
         q = url.partition('?')[2]
@@ -471,8 +496,8 @@ def log_files(s, since_ts):
     return out
 
 
-def scan_logs(s, parser, since_ts, ip=None):
-    """Разобранные строки журналов за период (порядок — по файлам)."""
+def scan_logs(s, parser, since_ts, ip=None, keep=None):
+    """Разобранные строки журналов за период (порядок — по файлам). keep — отбор адресов (например, сеть)."""
     since_min = since_ts // 60
     prefix = ip + ' ' if ip and parser.ip_first else None
     for f in log_files(s, since_ts):
@@ -482,7 +507,7 @@ def scan_logs(s, parser, since_ts, ip=None):
                     if prefix and not line.startswith(prefix):
                         continue
                     p = parser.parse(line)
-                    if p and p[1] >= since_min and (ip is None or p[0] == ip):
+                    if p and p[1] >= since_min and (ip is None or p[0] == ip) and (keep is None or keep(p[0])):
                         yield p
         except (OSError, EOFError) as e:
             log('журнал не прочитан:', f, e)
@@ -509,6 +534,7 @@ class Store:
     CREATE TABLE IF NOT EXISTS review_log(id INTEGER PRIMARY KEY, ts INT, ip TEXT, rule TEXT, verdict TEXT, action TEXT, evidence TEXT);
     CREATE TABLE IF NOT EXISTS ua_bans(ua TEXT PRIMARY KEY, ts INT, note TEXT);
     CREATE TABLE IF NOT EXISTS ua_seen(ua TEXT PRIMARY KEY, first_day TEXT, last_day TEXT);
+    CREATE TABLE IF NOT EXISTS load_ep(id INTEGER PRIMARY KEY, start INT, end INT, max1 REAL, max5 REAL, alerted INT, why TEXT);
     '''
 
     def __init__(self, state_dir):
@@ -726,8 +752,12 @@ class Mailer:
             if r and t - r[0] < (repeat_h or s.th('alert_repeat_h')) * 3600:
                 return False
             today = int(time.mktime(time.localtime(t)[:3] + (0, 0, 0, 0, 0, -1)))
-            n = st.q('SELECT COUNT(*) FROM alert_log WHERE ts>=? AND sent=1', (today,)).fetchone()[0]
-            if n >= s.th('alerts_per_day'):
+            # предел в сутки — отдельно для «работы над ошибками» и для остальных тревог: иначе в день с ошибками
+            # правил письма «закрыл бы зря?» выбирают предел, и тревога о выгрузке каталога не уходит
+            review = key.startswith('review:')
+            n = st.q("SELECT COUNT(*) FROM alert_log WHERE ts>=? AND sent=1 AND (subject LIKE '%работа над ошибками%') = ?",
+                     (today, 1 if review else 0)).fetchone()[0]
+            if n >= s.th('alerts_per_day' if review else 'alerts_all_per_day'):
                 st.q('INSERT INTO alert_log(ts, subject, sent) VALUES(?,?,0)', (t, subject))
                 return False
             st.q('INSERT OR REPLACE INTO alerts VALUES(?,?)', (key, t))
@@ -809,10 +839,16 @@ def nginx_quote(ua):
     return '"~^%s$"' % body
 
 
-def render_nginx(s, store, mailer, force=False):
-    """Пишет banned.conf и ua-banned.conf и перечитывает nginx, если что-то изменилось.
+def allow_body(s):
+    """allow.conf для geo nginx: белый список и адреса сервера — запреты по имени браузера их не касаются."""
+    return ''.join('%s 1;\n' % n for n in load_allow(s).nets)
 
-    banned.conf: в режиме enforce — все баны, в observe — ручные и правила из enforce_always (сканеры).
+
+def render_nginx(s, store, mailer, force=False):
+    """Пишет banned.conf, ua-banned.conf и allow.conf и перечитывает nginx, если что-то изменилось.
+
+    banned.conf: в режиме enforce — все баны, в observe — ручные и правила из enforce_always (сканеры,
+    подтверждённые боты, пулы без скриптов). Сети (--ban-net) — так же, как адреса.
     """
     if not s.nginx_dir or s.mode() == 'report' or not os.path.isdir(s.nginx_dir):
         return
@@ -829,7 +865,7 @@ def render_nginx(s, store, mailer, force=False):
         except ValueError:
             continue
     changed = []
-    for name, body in (('banned.conf', banned), ('ua-banned.conf', uas)):
+    for name, body in (('banned.conf', banned), ('ua-banned.conf', uas), ('allow.conf', allow_body(s))):
         path = os.path.join(s.nginx_dir, name)
         try:
             with open(path, encoding='utf-8') as f:
@@ -868,10 +904,27 @@ geo $antibot_ban {
     default 0;
     include %(dir)s/banned.conf;
 }
+# белый список и адреса сервера: запреты по имени браузера их не касаются
+geo $antibot_allow {
+    default 0;
+    include %(dir)s/allow.conf;
+}
 # закрытые имена браузеров (antibot --block-ua)
 map $http_user_agent $antibot_ua_ban {
     default 0;
     include %(dir)s/ua-banned.conf;
+}
+# Браузер без окна (Chrome headless) под любым именем: его выдаёт заголовок Sec-CH-UA, даже если программа сменила
+# имя браузера. У людей такого значения нет. Поисковики и проверки скорости страниц — мимо.
+# Выключить: antibot.ini, [features] block_headless = no
+map "$http_sec_ch_ua|$http_user_agent" $antibot_headless {
+    default 0;
+    "~*^[^|]*\\|.*(?:googlebot|google-inspectiontool|googleother|yandex|bingbot|mail\\.ru|applebot|lighthouse|pagespeed)" 0;
+    "~^[^|]*HeadlessChrome" %(headless)d;
+}
+map "$antibot_allow:$antibot_ua_ban$antibot_headless" $antibot_name_ban {
+    default 0;
+    "~^0:.*1" 1;
 }
 '''
 
@@ -883,7 +936,7 @@ if ($antibot_ban = 2) {
 if ($antibot_ban = 1) {
     rewrite ^ /__antibot-banned last;
 }
-if ($antibot_ua_ban) {
+if ($antibot_name_ban) {
     rewrite ^ /__antibot-banned last;
 }
 location = /__antibot-banned {
@@ -924,12 +977,13 @@ def nginx_files(s, store, mailer):
     page = BAN_PAGE % {'domain': html.escape(s.domain), 'contact': contact}
     written = []
     os.makedirs(s.nginx_dir, exist_ok=True)
-    for name in ('banned.conf', 'ua-banned.conf'):
+    for name in ('banned.conf', 'ua-banned.conf', 'allow.conf'):
         p = os.path.join(s.nginx_dir, name)
         if not os.path.exists(p):
-            open(p, 'w', encoding='utf-8').close()
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(allow_body(s) if name == 'allow.conf' else '')
             written.append((p, None))
-    for path, body in ((s.nginx_http_conf, NGINX_HTTP % {'dir': s.nginx_dir}),
+    for path, body in ((s.nginx_http_conf, NGINX_HTTP % {'dir': s.nginx_dir, 'headless': 1 if s.block_headless else 0}),
                        (s.nginx_site_conf, NGINX_SITE % {'path': s.nginx_site_conf, 'page': page})):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
@@ -960,11 +1014,15 @@ def load_windows(s):
         with open(os.path.join(s.state_dir, 'windows.pkl'), 'rb') as f:
             st = pickle.load(f)
         if st.get('v') == 1:
+            st.setdefault('GS', [collections.OrderedDict(), [0]])
+            st.setdefault('HB', {})
             return st
     except Exception:
         pass
+    # G — запросы браузеров за окно, GS — из них статика (видны ли картинки сайта в журнале вообще);
+    # HB — адрес → минута, когда он последний раз вёл себя как браузер (картинки, скрипты страницы, подсказки)
     return {'v': 1, 'W': {}, 'UA': {}, 'HD': {}, 'PU': {}, 'UAS': {}, 'G': [collections.OrderedDict(), [0]],
-            'sweep': 0}
+            'GS': [collections.OrderedDict(), [0]], 'HB': {}, 'sweep': 0}
 
 
 def save_windows(s, state):
@@ -972,6 +1030,75 @@ def save_windows(s, state):
     with open(tmp, 'wb') as f:
         pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, os.path.join(s.state_dir, 'windows.pkl'))
+
+
+def static_visible(br_total, br_static, th):
+    """Видны ли картинки сайта в журнале: у браузеров не меньше nojs_static_share запросов — статика. Когда картинки
+    отдаёт CDN или другой домен, «без картинок» у всех, и правила «без скриптов» и «пул» задели бы людей."""
+    return br_total >= 100 and br_static >= th('nojs_static_share') * br_total
+
+
+# ---------------------------------------------------------------- нагрузка сервера
+def read_loadavg():
+    """-> (load1, load5) или None (не Linux)."""
+    try:
+        with open('/proc/loadavg') as f:
+            p = f.read().split()
+        return float(p[0]), float(p[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def load_limit(s):
+    """Порог нагрузки: load_max из настроек, 0 — по числу ядер."""
+    return s.th('load_max') or (os.cpu_count() or 1)
+
+
+def proc_top(wait=2.0):
+    """[(процент одного ядра, пользователь, команда)] за wait секунд — по /proc, как top; None — /proc нет."""
+    if not os.path.isdir('/proc/self'):
+        return None
+    try:
+        tck = os.sysconf('SC_CLK_TCK')
+    except (ValueError, OSError, AttributeError):
+        tck = 100
+
+    def snap():
+        out = {}
+        for pid in os.listdir('/proc'):
+            if not pid.isdigit():
+                continue
+            try:
+                with open('/proc/%s/stat' % pid, 'rb') as f:
+                    raw = f.read()
+                head, rest = raw.rsplit(b')', 1)
+                rest = rest.split()
+                out[pid] = (int(rest[11]) + int(rest[12]), head.split(b'(', 1)[-1].decode('utf-8', 'replace'))
+            except (OSError, IndexError, ValueError):
+                pass
+        return out
+    a = snap()
+    time.sleep(wait)
+    b = snap()
+    res = []
+    for pid, (v, comm) in b.items():
+        d = v - a.get(pid, (v, ''))[0]
+        if d <= 0:
+            continue
+        try:
+            with open('/proc/%s/cmdline' % pid, 'rb') as f:
+                cmd = f.read().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+            uid = os.stat('/proc/%s' % pid).st_uid
+        except OSError:
+            continue
+        try:
+            import pwd
+            user = pwd.getpwuid(uid).pw_name
+        except Exception:
+            user = str(uid)
+        res.append((100.0 * d / tck / wait, user, cmd or '[%s]' % comm))
+    res.sort(key=lambda x: -x[0])
+    return res
 
 
 class Guard:
@@ -996,6 +1123,7 @@ class Guard:
         self.enforced_mode = self.s.mode() == 'enforce'
         bans = self.st.q('SELECT ip, kind, rule FROM bans WHERE until > ?', (now(),)).fetchall()
         self.banned_now = {r[0]: r[1] for r in bans}
+        self.net_bans = NetSet(r[0] for r in bans if '/' in r[0] and r[1])      # закрытые сети (--ban-net)
         # «закрыл бы» по мягкому правилу: пробы с такого адреса считаем дальше, чтобы сканер получил настоящий бан
         always = self.s.policy('enforce_always')
         self.soft = {r[0] for r in bans if not r[1] and r[2] not in always and r[2] != 'manual'} \
@@ -1043,8 +1171,8 @@ class Guard:
                 out[i] += v[i]
         return out
 
-    def _g_add(self, minute, n):
-        bk, tot = self.state['G']
+    def _g_add(self, minute, n, key='G'):
+        bk, tot = self.state[key]
         if bk:
             last = next(reversed(bk))
             minute = max(minute, last)
@@ -1052,18 +1180,23 @@ class Guard:
         tot[0] += n
 
     def _g_expire(self, now_min):
-        bk, tot = self.state['G']
         cut = now_min - self.win + 1
-        while bk:
-            m = next(iter(bk))
-            if m >= cut:
-                break
-            tot[0] -= bk.pop(m)
+        for key in ('G', 'GS'):
+            bk, tot = self.state[key]
+            while bk:
+                m = next(iter(bk))
+                if m >= cut:
+                    break
+                tot[0] -= bk.pop(m)
 
     # --- строки журнала
     def add(self, p):
         ip, minute, meth, url, st, size, ref, ua = p
         if ip in self.allow:
+            return
+        if self.net_bans.nets and ip in self.net_bans:
+            self.dly['banned_hits'] += 1                      # закрытая сеть: отказ отдаёт nginx, правила не нужны
+            self.dly['net_banned_hits'] += 1
             return
         r = self.r
         S = self.state
@@ -1125,8 +1258,12 @@ class Guard:
             return
         cls, fam = r.ua_class(ua)
         S['UA'][ip] = (ua[:300], cls, fam, minute)
+        if is_static or (r.typing and r.typing.search(url)) or (r.js and r.js.search(url)):
+            S['HB'][ip] = minute                              # вёл себя как браузер: картинки, скрипты, подсказки
         if cls == 'br':
             self._g_add(minute, 1)
+            if is_static:
+                self._g_add(minute, 1, 'GS')
             if page:
                 u = S['UAS'].setdefault(ip, {})
                 if len(u) < 40 or ua[:150] in u:
@@ -1245,8 +1382,9 @@ class Guard:
                                     (tnow - s.th('grace_h') * 3600,))}
         paused = int(st.meta('pause_until', 0) or 0) > tnow
         g_total = S['G'][1][0]
-        new_bans = []
         th = s.th
+        nojs_on = static_visible(g_total, S['GS'][1][0], th)
+        new_bans = []
         for ip in self.active:
             if ip not in UA:
                 continue
@@ -1303,6 +1441,12 @@ class Guard:
                     rule = 'login'
                 elif h[RF] >= th('refusals_hour'):
                     rule = 'refusals'
+                # без скриптов: под именем браузера страница за страницей, а картинок, скриптов страницы, подсказок и
+                # POST нет, и за сутки адрес ни разу не вёл себя как браузер и не приходил из поиска
+                elif soft_ok and warm and nojs_on and cls == 'br' and no_static and h[TY] == 0 and h[JS] == 0 \
+                        and h[P] == 0 and pages >= th('nojs_pages') and NOJS_UA.search(ua) and not shared \
+                        and S['HB'].get(ip, -10 ** 9) < now_min - 1440 and not detail['human_before']:
+                    rule = 'nojs'
                 elif soft_ok and warm and no_static and h[TY] == 0 and h[PR] >= th('headless_products'):
                     rule = 'headless'
                 elif soft_ok and warm and no_static and h[TY] == 0 and h[JS] == 0 and h[P] == 0 \
@@ -1331,7 +1475,8 @@ class Guard:
                            '(set_real_ip_from / real_ip_header).' % (ip, fmt(h[REQ]), fmt(g_total),
                                                                     len(S['UAS'].get(ip, ())), RULE_NAMES.get(rule, rule)))
                 continue
-            self.ban(ip, rule, detail, paused=paused)
+            # «без скриптов» — короткий бан без удлинения при повторе: домашние адреса пула потом достаются людям
+            self.ban(ip, rule, detail, hours=s.ban_hours('nojs')[0] if rule == 'nojs' else None, paused=paused)
             if S['PU'].get(ip):
                 st.q('UPDATE review SET uas=? WHERE ip=? AND verdict IS NULL',
                      (json.dumps({PROBE_KEY: sorted(S['PU'][ip])[:20]}, ensure_ascii=False), ip))
@@ -1342,10 +1487,12 @@ class Guard:
         self.check_flood()
         self.breaker()
         if not s.replay:
+            self.load_watch(now_min)
             self.self_check()
             self.mail.retry()
         if now_min - S.get('sweep', 0) >= 15:
             self.sweep(now_min)
+            self.pools(now_min)
         st.q('DELETE FROM traffic WHERE t5 < ?', (tnow - 15 * 86400,))
         st.q('DELETE FROM ticks WHERE h < ?', (tnow // 3600 - 24 * 15,))
         st.q('DELETE FROM bans WHERE until < ?', (tnow - 86400,))
@@ -1364,8 +1511,9 @@ class Guard:
             if not S['W'][ip][0]:
                 del S['W'][ip]
                 S['UA'].pop(ip, None)
-        for ip in [i for i, m in S['HD'].items() if m < now_min - 1440]:
-            del S['HD'][ip]
+        for key in ('HD', 'HB'):
+            for ip in [i for i, m in S[key].items() if m < now_min - 1440]:
+                del S[key][ip]
         for key, keep in (('PU', 1440), ('UAS', self.win)):
             for ip in list(S[key]):
                 S[key][ip] = {u: m for u, m in S[key][ip].items() if m >= now_min - keep}
@@ -1414,6 +1562,19 @@ class Guard:
                            '(обычно мобильные или домашние прокси). Каждый закрывается после порога своего правила.\n\n'
                            'Сети: %s' % ('закрыл' if enforced else 'закрыл бы', wave[0],
                                          ', '.join('%s — %d' % kv for kv in nets.most_common(10))), key='wave')
+        nj = st.q("SELECT ip, detail FROM ban_log WHERE ts > ? AND rule='nojs'", (t - 3600,)).fetchall()
+        if len(nj) >= th('nojs_wave'):
+            nets = collections.Counter(net_of(i, 16) for i, _ in nj)
+            uas = collections.Counter((json.loads(d or '{}').get('ua') or '')[:100] for _, d in nj)
+            self.mail.send('пул без скриптов: %d адресов за час' % len(nj),
+                           'Коротко: за последний час %d адресов брали каталог под именем обычного браузера, но без '
+                           'картинок, скриптов страницы и подсказок. Каждый закрыт на %g ч после %d страниц. Так ходит '
+                           'пул выгрузки с домашних или мобильных прокси. Делать ничего не нужно. Если идёт часами — '
+                           'посмотрите сети и имена ниже: облачную сеть можно закрыть целиком (--ban-net), необычное '
+                           'имя — по имени (--block-ua).\n\nСети: %s\nИмена браузера: %s'
+                           % (len(nj), s.ban_hours('nojs')[0], th('nojs_pages'),
+                              ', '.join('%s — %d' % kv for kv in nets.most_common(10)),
+                              '; '.join('%s — %d' % kv for kv in uas.most_common(5))), key='nojs_wave')
         for ip, url, size, ua in self.leaks[:5]:
             self.mail.send('ВНИМАНИЕ, сайт отдал служебный файл',
                            'Коротко: на запрос %s с адреса %s сайт ответил кодом 200 и отдал %s байт. Такие файлы '
@@ -1458,6 +1619,142 @@ class Guard:
                            '«antibot --daily 1» на сервере.' % (time.strftime('%H:%M', time.localtime(t5 + 300)),
                                                                fmt(r[0]), fmt(med)), key='flood', repeat_h=1)
 
+    def pools(self, now_min):
+        """Пул разовых адресов: за час с одним именем браузера много адресов, у каждого 1–pool_max_pages страниц
+        каталога и ни одного признака браузера. Правила по адресу такого не видят — адрес приходит один раз.
+        Только письмо: закрыть можно имя (--block-ua) или облачную сеть (--ban-net) — решает владелец."""
+        s, th, S = self.s, self.s.th, self.state
+        if not static_visible(S['G'][1][0], S['GS'][1][0], th):
+            return                                            # картинки отдаёт CDN: «без картинок» у всех, и у людей
+        by = {}
+        for ip, e in S['W'].items():
+            u = S['UA'].get(ip)
+            if not u or u[1] in ('se', 'ai') or ip in self.banned_now:
+                continue
+            h = e[1]
+            pages = h[PR] + h[CT] + h[SR]
+            d = by.get(u[0][:150])
+            if d is None:
+                d = by[u[0][:150]] = [0, 0, 0, []]           # все адреса с этим именем, разовые, их страниц, примеры
+            d[0] += 1
+            if 1 <= pages <= th('pool_max_pages') and h[ST] == 0 and h[TY] == 0 and h[JS] == 0 and h[RF] == 0 \
+                    and S['HB'].get(ip, -10 ** 9) < now_min - 1440 and S['HD'].get(ip, -10 ** 9) < now_min - 1440:
+                d[1] += 1
+                d[2] += pages
+                if len(d[3]) < 500:
+                    d[3].append(ip)
+        if not by:
+            return
+        blocked = {row[0][:150] for row in self.st.q('SELECT ua FROM ua_bans')}
+        for ua, (n_all, n, pages, ips) in by.items():
+            # у людей с тем же именем браузера картинки грузятся: разовых без картинок среди них — меньшинство
+            if n < th('pool_ips') or n < 0.8 * n_all or ua in blocked:
+                continue
+            self.st.add_daily(day_key(), 'pool_ips', n)
+            nets = collections.Counter(net_of(i, 16) for i in ips)
+            fake = self.r.is_fake(ua)
+            log('пул разовых адресов:', n, 'адресов,', ua[:100])
+            self.mail.send('пул разовых адресов: %d за час с одним именем браузера' % n,
+                           'Коротко: похоже, каталог выкачивают по множеству разовых адресов (обычно домашние или '
+                           'мобильные прокси). За последний час %d адресов с одним именем браузера, %s страниц, у каждого '
+                           'адреса не больше %d и ни картинок, ни скриптов страницы. Правила по адресу такого не видят: '
+                           'адрес приходит один раз. Сторож ничего не закрывал.\n\n'
+                           'Имя браузера: %s%s\nСети: %s\nАдреса (первые): %s\n\n'
+                           'Что можно сделать (решаете вы):\n'
+                           '  1) закрыть имя: antibot --block-ua "имя" — сначала проверит, нет ли под ним людей;\n'
+                           '  2) если адреса из одной облачной сети — закрыть сеть: antibot --ban-net СЕТЬ ЧАСОВ "причина" '
+                           '(тоже проверит людей);\n'
+                           '  3) если пул возвращается под разными именами — нужна проверка JavaScript на самом сайте.'
+                           % (n, fmt(pages), th('pool_max_pages'), ua,
+                              '\n  (так настоящий браузер не подписывается — имя подделано)' if fake else '',
+                              ', '.join('%s — %d' % kv for kv in nets.most_common(8)), ', '.join(ips[:10])),
+                           key='pool:' + ua[:80], repeat_h=6)
+
+    def load_watch(self, now_min):
+        """Средняя нагрузка сервера за 5 минут выше порога дольше load_min минут — одно письмо на эпизод: что грузит.
+        Резервная копия и обновление системы — штатно, без письма. Сторож сам ничего не останавливает."""
+        s, st = self.s, self.st
+        if not s.load_watch:
+            return
+        la = read_loadavg()
+        if la is None:
+            return
+        l1, l5 = la
+        lim = load_limit(s)
+        t = now()
+        run_ = st.meta('load_run') or ''                    # 'начало|пик load1|пик load5|письмо ушло'
+        if l5 <= lim:
+            if run_:
+                start, m1, m5, al = run_.split('|')
+                if t - int(start) >= s.th('load_min') * 60:
+                    st.q('INSERT INTO load_ep(start, end, max1, max5, alerted, why) VALUES(?,?,?,?,?,?)',
+                         (int(start), t, float(m1), float(m5), int(al), st.meta('load_why') or ''))
+                    log('нагрузка вернулась ниже %g: была выше %d мин, пик %.1f' % (lim, (t - int(start)) // 60, float(m1)))
+                for k in ('load_run', 'load_why', 'load_check'):
+                    st.set_meta(k, '')
+            return
+        st.add_daily(day_key(t), 'load:over_min', 1)
+        if not run_:
+            st.set_meta('load_run', '%d|%s|%s|0' % (t, l1, l5))
+            return
+        start, m1, m5, al = run_.split('|')
+        m1, m5 = max(float(m1), l1), max(float(m5), l5)
+        mins = (t - int(start)) // 60
+        if mins >= s.th('load_min') and al == '0' and t - int(st.meta('load_check') or 0) >= s.th('load_min') * 60 - 30:
+            st.set_meta('load_check', t)
+            why, routine = self.load_culprits(now_min, lim)
+            st.set_meta('load_why', why[:4000])
+            if routine:
+                log('нагрузка %.1f выше %g уже %d мин — штатно (%s), без письма' % (l5, lim, mins, routine))
+            else:
+                self.mail.send('нагрузка сервера выше %g' % lim,
+                               'Коротко: средняя нагрузка сервера %.1f — выше %g уже %d минут (с %s, пик %.1f). Сайт '
+                               'работает, но может отвечать медленнее. Ниже — что сейчас грузит; сторож сам ничего не '
+                               'останавливает. Резервную копию и обновление системы сторож узнаёт сам и о них не пишет. '
+                               'Следующее письмо — только когда нагрузка опустится и снова поднимется.\n\n%s'
+                               % (l5, lim, mins, time.strftime('%H:%M', time.localtime(int(start))), m1, why),
+                               key='load', repeat_h=1)
+                al = '1'
+        st.set_meta('load_run', '%s|%s|%s|%s' % (start, m1, m5, al))
+
+    def load_culprits(self, now_min, lim):
+        """-> (текст: процессы, сайт, активные адреса; штатная причина или '')."""
+        out, kinds = [], []
+        procs = proc_top()
+        if procs is None:
+            out.append('Процессы: не прочитались (нет /proc).')
+        else:
+            busy = [p for p in procs if p[0] >= 5][:10]
+            out.append('Процессы (процент одного ядра за 2 секунды):')
+            out += ['  %6.0f %%  %-12s %s' % (c, u[:12], cmd[:120]) for c, u, cmd in busy] or \
+                ['  ни один не занят больше 5 %']
+            for name, rx in LOAD_ROUTINE:
+                if any(rx.search(cmd) for c, u, cmd in procs):
+                    kinds.append(name)
+        t5 = (now() // 300 - 1) * 300
+        r = self.st.q('SELECT dyn FROM traffic WHERE t5=?', (t5,)).fetchone()
+        base = sorted(x[0] for x in self.st.q('SELECT dyn FROM traffic WHERE t5 IN (%s)' %
+                                              ','.join(str(t5 - d * 86400) for d in range(1, 8))))
+        usual = base[len(base) // 2] if base else 0
+        busy_site = bool(r and usual and r[0] >= 2 * usual)
+        if r:
+            out.append('Сайт за 5 минут: %s динамических запросов (обычно в это время — %s).'
+                       % (fmt(r[0]), fmt(usual) if base else 'данных пока нет'))
+        act = sorted(((self._sum5(ip, now_min), ip) for ip in self.state['W']), key=lambda x: -x[0][D])[:5]
+        act = [(h, ip) for h, ip in act if h[D] >= 30]
+        if act:
+            out.append('Самые активные адреса за 5 минут (запросов к страницам / из них каталог / картинок):')
+            out += ['  %-16s %5d %5d %5d  %s' % (ip, h[D], h[PR] + h[CT] + h[SR], h[ST],
+                                                 self.state['UA'].get(ip, ('',))[0][:60]) for h, ip in act]
+        routine = ', '.join(kinds) if kinds and not busy_site else ''
+        if routine:
+            head = 'Штатно: %s.' % routine
+        elif kinds:
+            head = 'Идёт штатное (%s), но не только оно: к сайту запросов вдвое больше обычного.' % ', '.join(kinds)
+        else:
+            head = 'Штатных причин (резервная копия, обновление системы) не видно.'
+        return head + '\n' + '\n'.join(out), routine
+
     def self_check(self):
         s, st = self.s, self.st
         t = now()
@@ -1478,14 +1775,12 @@ class Guard:
                                key='include', repeat_h=12)
 
 
-def net_of(ip):
+def net_of(ip, v4=24, v6=48):
     try:
         a = ipaddress.ip_address(ip)
     except ValueError:
         return ip
-    if a.version == 4:
-        return str(ipaddress.ip_network(ip + '/24', strict=False))
-    return str(ipaddress.ip_network(ip + '/48', strict=False))
+    return str(ipaddress.ip_network('%s/%d' % (ip, v4 if a.version == 4 else v6), strict=False))
 
 
 def do_ban(s, store, ip, rule, detail, hours=None, paused=False, enforced_mode=None):
@@ -1551,7 +1846,8 @@ def review_pass(s, store, ver, allow, mailer, enforced_mode):
             th_.join(max(0, deadline - time.time()))
         for ip, (ok, host) in list(out.items()):
             store.q('UPDATE review SET rdns=?, rdns_ok=? WHERE ip=?', (host, ok, ip))
-    found = []
+    found, confirmed = [], []
+    blocked_uas = {r[0][:150] for r in store.q('SELECT ua FROM ua_bans')}
     rows = store.q('SELECT ip, rule, since, hits, pages, uas, bot_ua, se_ref, favicon, st, sg, post, js, human_before, '
                    'rdns, rdns_ok FROM review WHERE verdict IS NULL').fetchall()
     for ip, rule, since, hits, pages, uas, bot_ua, se_ref, fav, st_, sg, post, js, hb, rdns, rdns_ok in rows:
@@ -1612,11 +1908,28 @@ def review_pass(s, store, ver, allow, mailer, enforced_mode):
         if action == 'снят сам':
             store.q('DELETE FROM bans WHERE ip=?', (ip,))
             log('СНЯЛ' if enforced_mode or rule in always else 'снял бы', ip, verdict, '; '.join(ev))
+        # Подтверждённый бот: «закрыл бы» по мягкому правилу, а за сутки после — не меньше confirm_hits запросов и ни
+        # одного признака человека (картинки, значок, скрипты, подсказки, POST, приход из поиска, другие браузеры).
+        # Тогда настоящий бан и в наблюдении: первый — 7 суток, повтор за repeat_days — 30 (лестница повторов).
+        # Не трогаем: общие адреса людей (VPN), CDN, адреса, чьё имя браузера уже закрыто в nginx (адрес у пула
+        # разовый, потом он у людей), и тех, кто уже под настоящим баном.
+        if (verdict == 'bot' and rule in CONFIRM_RULES and ('confirmed' in always or enforced_mode)
+                and s.mode() != 'report' and hits >= th('confirm_hits')
+                and not (se_ref or hb or st_ or sg or post or fav or js or others)
+                and ip not in ver.r.shared and not (s.never_ban_cdn and ip in ver.r.cdn) and ip not in allow
+                and (bot_ua or '')[:150] not in blocked_uas
+                and not store.q('SELECT 1 FROM bans WHERE ip=? AND until>? AND kind>0', (ip, t)).fetchone()):
+            action = 'подтверждён — настоящий бан'
+            confirmed.append((ip, rule, bot_ua, hits, pages))
         store.q('UPDATE review SET verdict=? WHERE ip=?', (verdict, ip))
         store.q('INSERT INTO review_log(ts, ip, rule, verdict, action, evidence) VALUES(?,?,?,?,?,?)',
                 (t, ip, rule, verdict, action, '; '.join(ev)))
         if verdict in PROPOSAL:
             found.append((ip, rule, verdict, action, ev, uas, pages))
+    # бан — после записи вердикта: do_ban заводит новую проверку уже для настоящего бана
+    for ip, rule, bot_ua, hits, pages in confirmed:
+        do_ban(s, store, ip, 'confirmed', {'ua': (bot_ua or '')[:150], 'from_rule': rule, 'hits_after': hits,
+                                           'pages_after': pages}, enforced_mode=enforced_mode)
     store.q('DELETE FROM review WHERE since < ?', (t - 8 * 86400,))
     store.commit()
     if not found:
@@ -1796,18 +2109,21 @@ def cmd_replay(s, files):
 
 # ---------------------------------------------------------------- сводка за сутки и разбор адреса
 def _agg():
-    # uas — все имена браузеров; puas — только с обычных страниц: сканер меняет имя на каждой пробе, это не люди
+    # uas — все имена браузеров; puas — только с обычных страниц: сканер меняет имя на каждой пробе, это не люди;
+    # huas — имена, под которыми грузились картинки, скрипты страницы или подсказки (так выглядят люди за NAT);
+    # fake — запросов под подделанным именем браузера
     return {'req': 0, 'pages': 0, 'prod': 0, 'st': 0, 'js': 0, 'ty': 0, 'post': 0, 'head': 0, 'probe': 0, 'sqli': 0,
             'rf': 0, 'codes': collections.Counter(), 'uas': collections.Counter(), 'puas': collections.Counter(),
-            'se': 0, 'hours': set(), 'q': set(), 'refs': collections.Counter(), 'paths': collections.Counter(),
-            'after_codes': collections.Counter(), 'cls': '', 'fam': ''}
+            'huas': set(), 'fake': 0, 'se': 0, 'hours': set(), 'q': set(), 'refs': collections.Counter(),
+            'paths': collections.Counter(), 'after_codes': collections.Counter(), 'cls': '', 'fam': ''}
 
 
-def aggregate(s, r, parser, since, ip=None, after=None):
-    """Журнал за период -> {адрес: счётчики}. after — {адрес: время бана}: коды ответов после бана — в after_codes."""
+def aggregate(s, r, parser, since, ip=None, after=None, keep=None):
+    """Журнал за период -> {адрес: счётчики}. after — {адрес: время бана}: коды ответов после бана — в after_codes.
+    keep — отбор адресов (например, сеть для --ban-net)."""
     A = {}
     after = after or {}
-    for p in scan_logs(s, parser, since, ip):
+    for p in scan_logs(s, parser, since, ip, keep):
         a_ip, minute, meth, url, st, size, ref, ua = p
         a = A.get(a_ip)
         if a is None:
@@ -1824,8 +2140,12 @@ def aggregate(s, r, parser, since, ip=None, after=None):
         a['codes'][st] += 1
         a['hours'].add(minute // 60)
         a['uas'][ua[:200]] += 1
+        if r.is_fake(ua):
+            a['fake'] += 1
         if page and r.ua_class(ua)[0] == 'br':
             a['puas'][ua[:200]] += 1
+        if is_static or (r.typing and r.typing.search(url)) or (r.js and r.js.search(url)):
+            a['huas'].add(ua[:200])
         if hit or sqli:
             a['probe'] += 1
             a['sqli'] += 1 if sqli else 0
@@ -1876,7 +2196,11 @@ def se_state(r, dns, ip, fam):
 def signs(a, rdns='', se=None):
     """-> (за бота, за человека: сильные, слабые). se — проверка поисковика (se_state)."""
     bot, strong, weak = [], [], []
-    browsers = [u for u, n in a['puas'].items() if n <= 20]
+    # другие браузеры за адресом — только имена, под которыми грузились картинки или работали скрипты страницы:
+    # имена без единой картинки — это программа меняет имя, а не люди за NAT
+    small = [u for u, n in a['puas'].items() if n <= 20]
+    browsers = [u for u in small if u in a['huas']]
+    rotated = len(small) - len(browsers)
     if a['cls'] == 'se' and se != 1:
         bot.append('назвался поисковиком (%s), %s' % (a['fam'], {
             0: 'DNS это не подтвердил',
@@ -1893,6 +2217,10 @@ def signs(a, rdns='', se=None):
         bot.append('проб уязвимостей %d%s' % (a['probe'], ', из них SQL-инъекций %d' % a['sqli'] if a['sqli'] else ''))
     if a['cls'] in ('bot', 'empty'):
         bot.append('имя программы' if a['cls'] == 'bot' else 'без имени браузера')
+    if a['fake'] and a['fake'] * 2 >= a['req']:
+        bot.append('имя браузера подделано: так настоящий браузер не подписывается')
+    if rotated >= 3 and len(browsers) < 3:
+        bot.append('меняет имя браузера: %d имён без картинок и скриптов' % rotated)
     if a['rf'] >= 10:
         bot.append('отказов 403/429 от сайта: %d' % a['rf'])
     if len(a['hours']) >= 12:
@@ -1962,8 +2290,10 @@ def cmd_daily(s, hours):
     returned = [(ip, a) for ip, a in A.items() if ip in real_bans and a['after_codes']]
     leaking = [(ip, a) for ip, a in returned if a['after_codes'].get(200, 0) + a['after_codes'].get(304, 0) > 0]
     pool = []
+    nb = NetSet(k for k in real_bans if '/' in k)
     for ip, a in A.items():
-        if ip in allow or ip in dns_ok or ip in real_bans or (a['cls'] == 'se' and se_state(r, dns, ip, a['fam']) == 1):
+        if ip in allow or ip in dns_ok or ip in real_bans or (a['cls'] == 'se' and se_state(r, dns, ip, a['fam']) == 1) \
+                or (nb.nets and ip in nb):
             continue
         if a['pages'] >= 20 or a['probe'] or a['head'] >= 5 or a['rf'] >= 10 or a['req'] >= 500:
             pool.append((ip, a))
@@ -1978,6 +2308,8 @@ def cmd_daily(s, hours):
     cands, people = cands[:15], people[:10]
     bots = collections.Counter()
     bot_ips = collections.defaultdict(set)
+    fakes = collections.Counter()
+    fake_ips = collections.defaultdict(set)
     for ip, a in A.items():
         if a['cls'] in ('bot', 'empty'):
             for u, n in a['uas'].items():
@@ -1985,6 +2317,27 @@ def cmd_daily(s, hours):
                 if c in ('bot', 'empty'):
                     bots[u] += n
                     bot_ips[u].add(ip)
+        if a['fake']:
+            for u, n in a['uas'].items():
+                if r.is_fake(u):
+                    fakes[u] += n
+                    fake_ips[u].add(ip)
+    # пулы разовых адресов за период: одно имя, у адреса 1–pool_max_pages страниц, ни картинок, ни скриптов, не из поиска
+    pool_by = {}
+    br = [x for x in A.values() if x['cls'] == 'br']
+    visible = static_visible(sum(x['req'] for x in br), sum(x['st'] for x in br), s.th)
+    for ip, a in A.items():
+        if not visible or a['cls'] == 'se' or ip in allow or not a['uas']:
+            continue
+        u = a['uas'].most_common(1)[0][0]
+        d = pool_by.setdefault(u, [0, 0])
+        d[0] += 1
+        if 1 <= a['pages'] <= s.th('pool_max_pages') and not (a['st'] or a['js'] or a['ty'] or a['se']):
+            d[1] += 1
+    pools = sorted(((n, n_all, u) for u, (n_all, n) in pool_by.items() if n >= s.th('pool_ips') and n >= 0.8 * n_all),
+                   reverse=True)[:5]
+    net_bans = [row for row in active_bans.values() if '/' in row[0]]
+    load_eps = store.q('SELECT start, end, max1, alerted, why FROM load_ep WHERE end >= ? ORDER BY start', (since,)).fetchall()
     today = day_key(t)
     new_names = []
     first_run = store.q('SELECT COUNT(*) FROM ua_seen').fetchone()[0] == 0   # в первый раз «новое» не помечаем
@@ -2030,6 +2383,10 @@ def cmd_daily(s, hours):
         short.append('Похожих на ботов без бана: %d — список ниже, решение за вами.' % len(likely))
     else:
         short.append('Явных ботов без бана в журнале не видно.')
+    if pools:
+        short.append('Пул разовых адресов: %d адресов с одним именем браузера — п. 9, решение за вами.' % pools[0][0])
+    if any(e[3] for e in load_eps):
+        short.append('Нагрузка сервера была выше порога — п. 10.')
     if leaking:
         short.append('ВНИМАНИЕ: закрытые адреса получают обычные ответы (%d) — баны не доходят до nginx.' % len(leaking))
     for f, avg in se_prev.items():
@@ -2059,6 +2416,8 @@ def cmd_daily(s, hours):
                  d.get('static_60', '?'), d.get('js_60', '?'), d.get('post_60', '?'), d.get('head_60', '?'),
                  d.get('ua', '')[:60]))
     w('   Действует банов: %d (из них «закрыл бы» — %d).' % (len(active_bans), sum(1 for v in active_bans.values() if not v[2])))
+    if net_bans:
+        w('   Закрытые сети: ' + '; '.join('%s до %s (%s)' % (row[0], hm(row[4]), (row[6] or '')[:40]) for row in net_bans))
     if returned:
         w('   Вернулись к бану (запросов после бана, коды): ' + ', '.join(
             '%s (%d, %s)' % (ip, sum(a['after_codes'].values()), dict(a['after_codes'].most_common(3)))
@@ -2106,12 +2465,28 @@ def cmd_daily(s, hours):
         w('   %6s / %-4d %s%s' % (fmt(n), len(bot_ips[u]), u[:90] or '(пусто)', '  ← новое' if u in new_names else ''))
     if not bots:
         w('   нет')
+    if fakes:
+        w('   Подделанные имена браузеров (так настоящий браузер не подписывается) — запросов / адресов:')
+        for u, n in fakes.most_common(8):
+            w('   %6s / %-4d %s' % (fmt(n), len(fake_ips[u]), u[:110]))
     w('')
     w('8. Поисковики, подтверждённые по DNS, запросов в сутки — за период / в среднем за прошлую неделю: ' +
       (', '.join('%s %d / %d' % (f, se_now[f], se_prev[f]) for f in sorted(set(se_now) | set(se_prev))) or 'данных пока нет'))
     w('')
+    w('9. Пулы разовых адресов (одно имя браузера, у адреса до %d страниц, ни картинок, ни скриптов, не из поиска):'
+      % s.th('pool_max_pages'))
+    for n, n_all, u in pools:
+        w('   %d адресов из %d с этим именем%s · %s' % (n, n_all, ' · имя подделано' if r.is_fake(u) else '', u[:110]))
+    if not pools:
+        w('   нет')
+    w('')
+    w('10. Нагрузка сервера выше %g дольше %d мин: %s' % (load_limit(s), s.th('load_min'), '' if load_eps else 'не было'))
+    for st0, en, m1, al, why in load_eps:
+        w('   %s–%s, пик %.1f, %s · %s' % (hm(st0), time.strftime('%H:%M', time.localtime(en)), m1,
+                                        'письмо' if al else 'штатно, без письма', (why or '').split('\n', 1)[0][:100]))
+    w('')
     w('Команды: antibot --who АДРЕС · --ban АДРЕС ЧАСОВ "причина" · --unban АДРЕС · --allow АДРЕС "кто это" · '
-      '--block-ua "точное имя"')
+      '--block-ua "точное имя" · --ban-net СЕТЬ ЧАСОВ "причина"')
     print('\n'.join(out))
 
 
@@ -2142,6 +2517,9 @@ def cmd_who(s, ip, hours):
     if b:
         print('Бан сейчас: %s, %s, с %s до %s, отказов %d' % (RULE_NAMES.get(b[0], b[0]), 'действует' if b[1] else '«закрыл бы»',
                                                            hm(b[2]), hm(b[3]), b[4]))
+    for net, until, note in store.q("SELECT ip, until, note FROM bans WHERE ip LIKE '%/%' AND until > ?", (t,)):
+        if ip in NetSet([net]):
+            print('Входит в закрытую сеть %s (до %s): %s' % (net, hm(until), note or ''))
     for row in store.q('SELECT ts, rule, until, enforced FROM ban_log WHERE ip=? ORDER BY ts DESC LIMIT 10', (ip,)):
         print('  бан %s %s до %s%s' % (hm(row[0]), RULE_NAMES.get(row[1], row[1]), hm(row[2]), '' if row[3] else ' (закрыл бы)'))
     for row in store.q('SELECT ts, verdict, action, evidence FROM review_log WHERE ip=? ORDER BY ts DESC LIMIT 5', (ip,)):
@@ -2244,11 +2622,23 @@ def cmd_unblock_ua(s, ua):
 
 
 # ---------------------------------------------------------------- ручные команды
+def norm_net(text):
+    """Сеть в виде 203.0.113.0/24 или None."""
+    if '/' not in text:
+        return None
+    try:
+        return str(ipaddress.ip_network(text, strict=False))
+    except ValueError:
+        return None
+
+
 def cmd_manual(s, args):
     store = Store(s.state_dir)
     cmd, ip = args[0], args[1]
-    if not valid_ip(ip):
-        raise SystemExit('не адрес: %s (баны — только по одному адресу)' % ip)
+    if cmd == '--unban' and norm_net(ip):
+        ip = norm_net(ip)                                  # снять бан сети (--ban-net)
+    elif not valid_ip(ip):
+        raise SystemExit('не адрес: %s (баны — по одному адресу; сеть целиком — --ban-net)' % ip)
     t = now()
     if cmd in ('--unban', '--allow'):
         store.q('DELETE FROM bans WHERE ip=?', (ip,))
@@ -2268,6 +2658,53 @@ def cmd_manual(s, args):
         print('закрыт до %s' % time.strftime('%d.%m.%Y %H:%M', time.localtime(until)))
     store.commit()
     render_nginx(s, store, Mailer(s, store), force=True)
+
+
+def cmd_ban_net(s, args):
+    """Бан сети целиком — для облаков и хостингов, откуда идёт пул. Сначала: с чем сеть пересекается и кто из неё
+    приходил за все дни журнала. Есть похожие на людей — не закрывает (люди ходят и через VPN в облаках)."""
+    force = '--force' in args
+    args = [a for a in args if a != '--force']
+    if len(args) < 3:
+        raise SystemExit('--ban-net СЕТЬ ЧАСОВ [причина] [--force]')
+    net = norm_net(args[1])
+    if not net:
+        raise SystemExit('не сеть: %s (нужно так: 203.0.113.0/24)' % args[1])
+    n = ipaddress.ip_network(net)
+    if n.prefixlen < (12 if n.version == 4 else 29):
+        raise SystemExit('сеть %s слишком большая: не шире /12 (IPv6 — /29). Закрывайте сети провайдера по частям.' % net)
+    hours = float(args[2])
+    reason = ' '.join(args[3:]) or 'сеть вручную'
+    r = Rules(s)
+    clash = [name for name, ns in [('белый список или адреса сервера', load_allow(s)), ('CDN Cloudflare', r.cdn),
+                                   ('общие адреса людей (VPN)', r.shared)] +
+             [('сеть поисковика ' + f, x) for f, x in r.se_nets.items()]
+             if any(m.version == n.version and m.overlaps(n) for m in ns.nets)]
+    if clash:
+        raise SystemExit('не закрыто: сеть %s пересекается с: %s' % (net, ', '.join(clash)))
+    inside = NetSet([net])
+    parser = LogParser(s)
+    A = aggregate(s, r, parser, 0, keep=lambda ip: ip in inside)
+    first = min((min(a['hours']) for a in A.values() if a['hours']), default=None)
+    people = []
+    for ip, a in A.items():
+        bot, strong, weak = signs(a)
+        if strong:
+            people.append((ip, a, strong))
+    print('Сеть %s: в журнале%s — %d адресов, %s запросов, страниц каталога %s, проб %d.'
+          % (net, ' с %s' % time.strftime('%d.%m.%Y', time.localtime(first * 3600)) if first is not None else '',
+             len(A), fmt(sum(a['req'] for a in A.values())), fmt(sum(a['pages'] for a in A.values())),
+             sum(a['probe'] for a in A.values())))
+    for ip, a, strong in people[:10]:
+        print('  похоже, человек: %s — %s' % (ip, '; '.join(strong)))
+    if people and not force:
+        raise SystemExit('Не закрыто: в сети %d адресов с признаками человека (из поиска, набирали текст, несколько '
+                         'браузеров с картинками). Разберите их (--who); закрыть всё равно — добавьте --force.' % len(people))
+    store = Store(s.state_dir)
+    until = do_ban(s, store, net, 'manual', {'ua': reason}, hours)
+    store.commit()
+    render_nginx(s, store, Mailer(s, store), force=True)
+    print('сеть %s закрыта до %s' % (net, time.strftime('%d.%m.%Y %H:%M', time.localtime(until))))
 
 
 def cmd_mode(s, m):
@@ -2296,6 +2733,14 @@ def cmd_report(s):
         print('  %-16s %-10s до %s отказов %6d %s' % (ip, rule, hm(until), hits, (note or '')[:50]))
     print('Закрытые имена браузеров:', ', '.join(r[0][:60] for r in store.q('SELECT ua FROM ua_bans')) or 'нет')
     print('Последний проход:', hm(int(store.meta('last_tick', 0) or 0)) if store.meta('last_tick') else '—')
+    la = read_loadavg()
+    run_ = store.meta('load_run') or ''
+    print('Нагрузка сервера: %s (порог %g дольше %d мин)%s' % (
+        '%.2f / %.2f' % la if la else 'не читается', load_limit(s), s.th('load_min'),
+        '; выше порога с %s' % hm(int(run_.split('|')[0])) if run_ else ''))
+    for st0, en, m1, al in store.q('SELECT start, end, max1, alerted FROM load_ep ORDER BY start DESC LIMIT 5'):
+        print('  %s–%s, пик %.1f%s' % (hm(st0), time.strftime('%H:%M', time.localtime(en)), m1,
+                                      ' — письмо' if al else ' — штатно, без письма'))
 
 
 def cmd_weekly(s):
@@ -2317,7 +2762,8 @@ def cmd_weekly(s):
     real = collections.Counter(b[1] for b in bl if b[2])
     would = collections.Counter(b[1] for b in bl if not b[2])
     top = sorted(bl, key=lambda b: -(json.loads(b[3] or '{}').get('dyn_60', 0) + b[4]))[:10]
-    nets = collections.Counter(net_of(b[0]) for b in bl if b[1] in ('parser', 'headless', 'pagination', 'head'))
+    nets = collections.Counter(net_of(b[0]) for b in bl if b[1] in ('parser', 'headless', 'pagination', 'head', 'nojs'))
+    le = store.q('SELECT start, end, max1, alerted, why FROM load_ep WHERE end > ? ORDER BY start', (t0,)).fetchall()
     al = store.q("SELECT subject, sent FROM alert_log WHERE ts > ? AND subject NOT LIKE '%сводка за неделю%'", (t0,)).fetchall()
     rl = store.q('SELECT verdict, action, COUNT(*) FROM review_log WHERE ts > ? GROUP BY verdict, action', (t0,)).fetchall()
     rv_bad = sum(n for v, a, n in rl if v in ('good-bot', 'human', 'shared', 'typing'))
@@ -2335,8 +2781,20 @@ def cmd_weekly(s):
         if b and a < b * 0.7:
             parts.append('ВНИМАНИЕ: робот %s за неделю пришёл %s раз против %s неделей раньше — проверить, не режем ли его.'
                          % (f, fmt(a), fmt(b)))
+    if le:
+        parts.append('Нагрузка сервера была выше %g дольше %d минут %d раз, всего %s минут, пик %.1f.'
+                     % (load_limit(s), s.th('load_min'), len(le), fmt(sum((e - s0) // 60 for s0, e, *_ in le)),
+                        max(x[2] for x in le)))
     parts.append('Тревог за неделю: %d.' % len(al) if al else 'Тревог не было.')
     body = [' '.join(parts), '', 'Режим: %s. Запросов за неделю: %s, динамических: %s.' % (mode, fmt(daily['req']), fmt(daily['dyn'])), '']
+    if daily['pool_ips']:
+        body += ['Пулы разовых адресов (письма «пул»): всего адресов в них за неделю — %s.' % fmt(daily['pool_ips']), '']
+    if le:
+        body.append('Нагрузка сервера выше порога:')
+        body += ['  %s–%s  %4d мин, пик %.1f, %s · %s' % (hm(s0), time.strftime('%H:%M', time.localtime(e)), (e - s0) // 60,
+                                                         m1, 'письмо' if a_ else 'штатно', (why or '').split('\n', 1)[0][:80])
+                 for s0, e, m1, a_, why in le]
+        body.append('')
     if top:
         body.append('Самые тяжёлые (запросов за час до бана / отбито после):')
         for ip, rule, enf, det, hits in top:
@@ -2380,6 +2838,11 @@ def cmd_check_config(s):
                 'подключена' if '/__antibot-banned' in out else 'не подключена'))
     print('Почта: %s → %s%s' % (s.mail['method'] or ('smtp' if s.mail['smtp_host'] else 'sendmail'), s.mail['to'] or '(нет адреса!)',
                                  ', копия сводки: ' + s.mail['copy_to'] if s.mail['copy_to'] else ''))
+    print('Закрывает и в наблюдении: %s. Браузер без окна (Sec-CH-UA): %s. Нагрузка: %s.' % (
+        ', '.join(RULE_NAMES.get(x, x) for x in sorted(s.policy('enforce_always'))) or 'никого',
+        'закрывается' if s.block_headless else 'не закрывается',
+        'письмо, если выше %g дольше %d мин (ядер %d)' % (load_limit(s), s.th('load_min'), os.cpu_count() or 1)
+        if s.load_watch else 'не следит'))
     try:
         size = os.path.getsize(s.log)
         with open(s.log, 'rb') as f:
@@ -2390,6 +2853,7 @@ def cmd_check_config(s):
         return
     ok = 0
     k = collections.Counter()
+    br_all = br_static = 0
     for line in tail:
         p = parser.parse(line)
         if not p:
@@ -2397,6 +2861,9 @@ def cmd_check_config(s):
         ok += 1
         ip, minute, meth, url, st, size_, ref, ua = p
         path = url.split('?', 1)[0]
+        if r.ua_class(ua)[0] == 'br':
+            br_all += 1
+            br_static += 1 if r.is_static(path) else 0
         if r.is_static(path):
             k['статика'] += 1
         elif r.probe_hit(path, url) or r.is_sqli(url):
@@ -2420,6 +2887,11 @@ def cmd_check_config(s):
     if ok and not k['статика']:
         print('Статики в журнале нет: если картинки отдаёт CDN или другой домен, правила «без картинок» будут ловить '
               'людей — поднимите parser_products или задайте признак скриптов (patterns js).')
+    if br_all:
+        share = br_static / br_all
+        print('Статика у браузеров: %d %% запросов — %s' % (
+            100 * share, 'правило «без скриптов» и письма о пулах работают' if share >= s.th('nojs_static_share') else
+            'мало: правило «без скриптов» и письма о пулах молчат, чтобы не задеть людей (картинки отдаёт CDN?)'))
 
 
 # ---------------------------------------------------------------- вход
@@ -2479,6 +2951,8 @@ def main():
             cmd_who(s, args[1], int(args[2]) if len(args) > 2 else 24)
         elif cmd in ('--ban', '--unban', '--allow') and len(args) > 1:
             cmd_manual(s, args)
+        elif cmd == '--ban-net' and len(args) > 1:
+            cmd_ban_net(s, args)
         elif cmd == '--block-ua' and len(args) > 1:
             cmd_block_ua(s, args[1], '--force' in args[2:])
         elif cmd == '--unblock-ua' and len(args) > 1:

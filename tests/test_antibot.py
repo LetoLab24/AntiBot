@@ -215,6 +215,33 @@ class Patterns(Tmp):
         self.assertTrue(ver.in_lists('95.163.33.18', make_log.MAILRU))
         self.assertFalse(ver.in_lists('95.163.33.18', make_log.CHROME))
 
+    def test_fake_ua(self):
+        r = self.rules('custom')
+        for ua in ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 '
+                   'Safari/537.36',
+                   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36',
+                   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                   'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/148.0.0.0 '
+                   'Safari/537.36'):
+            self.assertTrue(r.is_fake(ua), ua)
+        for ua in (make_log.CHROME, make_log.IPHONE, make_log.GOOGLEBOT, 'Mozilla/5.0', 'curl/8.5.0', '-', '',
+                   'Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile '
+                   'Safari/537.36 YaBrowser/24.12.1.112.00 SA/3',
+                   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) '
+                   'Version/17.4 Safari/605.1.15'):
+            self.assertFalse(r.is_fake(ua), ua)
+
+    def test_bitrix_login_narrow(self):
+        """Битрикс: подбор пароля — только форма входа, сохранения в админке — нет."""
+        r = self.rules('bitrix')
+        for u in ('/bitrix/admin/', '/bitrix/admin/index.php?login=yes', '/bitrix/admin/?login=yes',
+                  '/auth/?login=yes', '/personal/?login=yes&backurl=%2F'):
+            self.assertTrue(r.login.search(u), u)
+        for u in ('/bitrix/admin/iblock_element_edit.php?IBLOCK_ID=2&type=catalog&ID=15',
+                  '/bitrix/admin/fileman_admin.php?lang=ru', '/catalog/?login=yesterday'):
+            self.assertFalse(r.login.search(u), u)
+
     def test_nginx_quote(self):
         for ua in ('Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'a.b+c*d? "q" \\back $x {y} [z] ^|'):
             q = ab.nginx_quote(ua)
@@ -253,9 +280,9 @@ class Replay(Tmp):
             self.assertIn(ip, expect, 'лишний бан %s %s (%s)' % (ip, rules[ip], engine))
         self.assertTrue(any('служебный файл' in a for a in alerts), alerts)
         self.assertTrue(any('CDN' in a for a in alerts), alerts)
-        # в наблюдении по-настоящему закрыты только сканеры
+        # в наблюдении по-настоящему закрыты только сканеры и пул без скриптов
         for ip, rs in rules.items():
-            self.assertEqual(bool(enforced[ip]), rs == {'scan'}, (ip, rs))
+            self.assertEqual(bool(enforced[ip]), bool(rs & {'scan', 'nojs'}), (ip, rs))
 
     def test_custom(self):
         self.check('custom', make_log.EXPECT_CUSTOM)
@@ -316,6 +343,87 @@ class Review(Tmp):
         self.assertEqual(verdict['198.51.100.42'], ('parser', 'shared'))
         bans = list(db.execute("SELECT rule, enforced FROM ban_log WHERE ip='198.51.100.40' ORDER BY id"))
         self.assertEqual(bans, [('refusals', 0), ('scan', 1)])
+
+    def replay(self, lines, extra=''):
+        log = os.path.join(self.d, 'access.log')
+        with open(log, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(l for _, l in sorted(lines)) + '\n')
+        state = tempfile.mkdtemp(prefix='replay-', dir=self.d)  # своя база на каждый прогон (Windows не даст удалить открытую)
+        quiet(ab.cmd_replay, ab.Settings(write_conf(self.d, extra=extra), state), [log])
+        return sqlite3.connect(os.path.join(state, 'antibot.sqlite3'))
+
+    def test_confirmed(self):
+        """«Закрыл бы» по мягкому правилу, а за сутки — 20+ запросов без единого признака человека: настоящий бан на
+        7 суток. Значок после бана — признак браузера: такого не подтверждаем."""
+        start = calendar.timegm((2026, 10, 20, 8, 0, 0))
+        L = make_log.line
+        lines = []
+        for ip, favicon in (('198.51.100.50', False), ('198.51.100.51', True)):
+            for i in range(70):
+                lines.append(L(ip, start + i * 30, 'GET', '/catalog/item-%d' % i, ua='python-requests/2.31'))
+            for k in range(27):                                  # дальше под «закрыл бы» по три страницы в час
+                lines.append(L(ip, start + 3600 + k * 1200, 'GET', '/catalog/next-%d' % k, ua='python-requests/2.31'))
+            if favicon:
+                lines.append(L(ip, start + 5000, 'GET', '/favicon.ico', ua=make_log.CHROME))
+        lines.append(L('203.0.113.200', start + 26 * 3600, 'GET', '/', ua=make_log.CHROME))
+        db = self.replay(lines)
+        bans = list(db.execute("SELECT rule, enforced, until - ts FROM ban_log WHERE ip='198.51.100.50' ORDER BY id"))
+        self.assertEqual(bans, [('parser', 0, 12 * 3600), ('confirmed', 1, 168 * 3600)])
+        act = db.execute("SELECT action FROM review_log WHERE ip='198.51.100.50'").fetchone()[0]
+        self.assertIn('подтверждён', act)
+        self.assertEqual([r[0] for r in db.execute("SELECT rule FROM ban_log WHERE ip='198.51.100.51'")], ['parser'])
+
+    def test_nojs(self):
+        """Без скриптов: под именем браузера 20+ страниц без картинок — бан на 3 ч. Не трогаем, если адрес грузил
+        картинки за сутки или пришёл из поиска, и если картинок сайта в журнале нет вовсе (CDN)."""
+        start = calendar.timegm((2026, 10, 20, 8, 0, 0))
+        L, CH = make_log.line, make_log.CHROME
+        people, bots = [], []
+        for k in range(120):                                       # люди: страница, стили, картинка
+            t = start + k * 60
+            people.append(L('192.0.2.%d' % (k % 120 + 1), t, 'GET', '/catalog/p-%d' % k, ua=make_log.IPHONE))
+            people.append(L('192.0.2.%d' % (k % 120 + 1), t + 1, 'GET', '/css/site.css', ua=make_log.IPHONE))
+            people.append(L('192.0.2.%d' % (k % 120 + 1), t + 2, 'GET', '/img/p-%d.jpg' % k, ua=make_log.IPHONE))
+        bots.append(L('198.51.100.61', start + 300, 'GET', '/img/a.png', ua=CH))       # грузил картинки час назад
+        bots.append(L('198.51.100.62', start + 600, 'GET', '/', ref='https://yandex.ru/search/?text=x', ua=CH))
+        for i in range(25):
+            for ip in ('198.51.100.60', '198.51.100.61', '198.51.100.62'):
+                bots.append(L(ip, start + 4200 + i * 60, 'GET', '/catalog/item-%d' % i, ua=CH))
+        db = self.replay(people + bots)
+        bans = {ip: (rule, enf, until - ts) for ip, rule, enf, until, ts in
+                db.execute('SELECT ip, rule, enforced, until, ts FROM ban_log')}
+        self.assertEqual(bans.get('198.51.100.60'), ('nojs', 1, 3 * 3600))
+        self.assertNotIn('198.51.100.61', bans)
+        self.assertNotIn('198.51.100.62', bans)
+        # картинки отдаёт CDN — в журнале их нет ни у кого: правило молчит
+        no_static = [x for x in people + bots if '/img/' not in x[1] and '/css/' not in x[1]]
+        db = self.replay(no_static)
+        self.assertEqual(list(db.execute("SELECT rule FROM ban_log WHERE rule='nojs'")), [])
+        # и письма «пул разовых адресов» про людей по одной странице нет: без картинок в журнале пулы не считаются
+        self.assertEqual([r[0] for r in db.execute("SELECT subject FROM alert_log WHERE subject LIKE '%пул%'")], [])
+
+    def test_pool_letter(self):
+        """Пул разовых адресов: 70 адресов по 2 страницы под одним (подделанным) именем — письмо. Люди с тем же
+        популярным именем, которые грузят картинки, — нет."""
+        start = calendar.timegm((2026, 10, 20, 8, 0, 0))
+        L = make_log.line
+        fake = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 '
+                'Safari/537.36')
+        lines = []
+        for k in range(70):
+            ip = '2001:db8::%x' % (k + 1)
+            lines.append(L(ip, start + k * 20, 'GET', '/catalog/a-%d' % k, ua=fake))
+            lines.append(L(ip, start + k * 20 + 3, 'GET', '/catalog/b-%d' % k, ua=fake))
+        for k in range(90):
+            ip = '192.0.2.%d' % (k + 1)
+            lines.append(L(ip, start + k * 20, 'GET', '/catalog/p-%d' % k))
+            lines.append(L(ip, start + k * 20 + 1, 'GET', '/img/p-%d.jpg' % k))
+        lines.append(L('203.0.113.200', start + 3000, 'GET', '/'))
+        db = self.replay(lines)
+        subj = [r[0] for r in db.execute('SELECT subject FROM alert_log')]
+        pool = [x for x in subj if 'пул разовых адресов' in x]
+        self.assertEqual(len(pool), 1, subj)
+        self.assertIn('70', pool[0])
 
 
 class Rotation(Tmp):
@@ -412,16 +520,113 @@ class Bans(Tmp):
         self.assertIn('203.0.113.20 1;', open(os.path.join(s.nginx_dir, 'banned.conf')).read())
 
     def test_nginx_files(self):
-        s = ab.Settings(write_conf(self.d))
+        s = ab.Settings(write_conf(self.d, extra='[allow]\naddresses =\n    198.51.100.10  # офис\n'))
         st = ab.Store(s.state_dir)
         quiet(ab.nginx_files, s, st, ab.Mailer(s, st))
         http = open(s.nginx_http_conf, encoding='utf-8').read()
         site = open(s.nginx_site_conf, encoding='utf-8').read()
         self.assertIn('geo $antibot_ban', http)
         self.assertIn('map $http_user_agent $antibot_ua_ban', http)
+        self.assertIn('geo $antibot_allow', http)
+        self.assertIn('"~^[^|]*HeadlessChrome" 1;', http)
+        self.assertIn('"~*^[^|]*\\|.*(?:googlebot', http)                 # в файле nginx — \| (поисковики мимо)
+        self.assertIn('if ($antibot_name_ban)', site)
+        self.assertNotIn('$antibot_ua_ban)', site)
+        allow = open(os.path.join(s.nginx_dir, 'allow.conf'), encoding='utf-8').read()
+        self.assertIn('198.51.100.10/32 1;', allow)
+        self.assertIn('127.0.0.0/8 1;', allow)
         self.assertIn('mailto:support@shop.example', site)
         self.assertIn('$remote_addr', site)
         self.assertNotIn("'", site.split("return 403 '", 1)[1].rstrip().rstrip("';\n}").rstrip("'"))
+        off = ab.Settings(write_conf(self.d, extra='[features]\nblock_headless = no\n'))
+        quiet(ab.nginx_files, off, st, ab.Mailer(off, st))
+        self.assertIn('"~^[^|]*HeadlessChrome" 0;', open(off.nginx_http_conf, encoding='utf-8').read())
+
+    def test_ban_net(self):
+        """Сеть целиком: не закрывает, если в ней были люди (или с --force); пересечения с CDN и белым списком —
+        отказ; адреса из закрытой сети сторож не разбирает — отказ им даёт nginx."""
+        s = ab.Settings(write_conf(self.d))
+        os.makedirs(s.nginx_dir)
+        t = int(time.time()) - 3600
+        L = make_log.line
+        lines = [L('203.0.113.77', t, 'GET', '/', ref='https://yandex.ru/search/?text=x'),
+                 L('203.0.113.77', t + 1, 'GET', '/img/a.png')]
+        lines += [L('203.0.113.78', t + 60 + i, 'GET', '/catalog/item-%d' % i, ua='python-requests/2.31') for i in range(30)]
+        with open(s.log, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(l for _, l in lines) + '\n')
+        self.assertRaises(SystemExit, quiet, ab.cmd_ban_net, s, ['--ban-net', '203.0.113.0/24', '720', 'облако'])
+        self.assertRaises(SystemExit, quiet, ab.cmd_ban_net, s, ['--ban-net', '104.16.0.0/16', '720'])   # CDN
+        self.assertRaises(SystemExit, quiet, ab.cmd_ban_net, s, ['--ban-net', '10.1.0.0/16', '720'])      # частная сеть
+        self.assertRaises(SystemExit, quiet, ab.cmd_ban_net, s, ['--ban-net', '20.0.0.0/8', '720'])      # слишком большая
+        out = quiet(ab.cmd_ban_net, s, ['--ban-net', '203.0.113.5/24', '720', 'облако', '--force'])
+        self.assertIn('203.0.113.77', out)
+        banned = open(os.path.join(s.nginx_dir, 'banned.conf')).read()
+        self.assertIn('203.0.113.0/24 1;', banned)
+        st = ab.Store(s.state_dir)
+        g = ab.Guard(s, ab.Rules(s), st, ab.Mailer(s, st))
+        p = ab.LogParser(s)
+        for i in range(40):
+            g.add(p.parse(L('203.0.113.99', t + 600 + i, 'GET', '/catalog/a-%d' % i, status=403)[1]))
+        quiet(g.evaluate)
+        self.assertIsNone(st.q("SELECT 1 FROM ban_log WHERE ip='203.0.113.99'").fetchone())
+        who = quiet(ab.cmd_who, s, '203.0.113.99', 24)
+        self.assertIn('Входит в закрытую сеть 203.0.113.0/24', who)
+        quiet(ab.cmd_manual, s, ['--unban', '203.0.113.0/24'])
+        self.assertNotIn('203.0.113.0/24', open(os.path.join(s.nginx_dir, 'banned.conf')).read())
+
+
+class Mail(Tmp):
+    def test_caps_split(self):
+        """Предел писем в сутки: «работа над ошибками» — свой, остальные тревоги — свой."""
+        s = ab.Settings(write_conf(self.d))
+        st = ab.Store(s.state_dir)
+        m = ab.Mailer(s, st)
+        saved = ab.DRY_MAIL
+        ab.DRY_MAIL = True
+        try:
+            sent = [quiet(lambda i=i: m.send('работа над ошибками — %d' % i, 'x', key='review:%d' % i)) for i in range(14)]
+            self.assertEqual(len(sent), 14)
+            n_rev = st.q("SELECT SUM(sent) FROM alert_log WHERE subject LIKE '%работа над ошибками%'").fetchone()[0]
+            self.assertEqual(n_rev, 12)
+            quiet(m.send, 'тяжёлый бот 203.0.113.1', 'x', 'heavy:203.0.113.1')
+            self.assertEqual(st.q("SELECT sent FROM alert_log WHERE subject LIKE '%тяжёлый%'").fetchone()[0], 1)
+        finally:
+            ab.DRY_MAIL = saved
+
+
+class Load(Tmp):
+    def test_load_watch(self):
+        """Нагрузка выше порога 10 минут — одно письмо на эпизод; резервная копия — без письма."""
+        s = ab.Settings(write_conf(self.d, extra='load_max = 3\n'))
+        st = ab.Store(s.state_dir)
+        g = ab.Guard(s, ab.Rules(s), st, ab.Mailer(s, st))
+        saved = ab.read_loadavg, ab.proc_top
+        la = [(5.0, 5.0)]
+        procs = [[(80.0, 'www-data', 'php-fpm: pool www')]]
+        ab.read_loadavg = lambda: la[0]
+        ab.proc_top = lambda wait=2.0: procs[0]
+        t0 = calendar.timegm((2026, 10, 20, 8, 0, 0))
+        try:
+            def at(minutes):
+                ab.CLOCK.fixed = t0 + minutes * 60
+                quiet(g.load_watch, (t0 // 60) + minutes)
+            for mnt in (0, 5, 11, 12):
+                at(mnt)
+            la[0] = (1.0, 1.0)
+            at(20)
+            la[0], procs[0] = (6.0, 6.0), [(90.0, 'root', '/usr/bin/mysqldump --all-databases')]
+            for mnt in (90, 101, 102):
+                at(mnt)
+            la[0] = (0.5, 0.5)
+            at(110)
+        finally:
+            ab.read_loadavg, ab.proc_top = saved
+        subj = [r[0] for r in st.q("SELECT subject FROM alert_log WHERE subject LIKE '%нагрузка%'")]
+        self.assertEqual(len(subj), 1, subj)
+        eps = list(st.q('SELECT alerted, why FROM load_ep ORDER BY start'))
+        self.assertEqual([e[0] for e in eps], [1, 0])
+        self.assertIn('php-fpm', eps[0][1])
+        self.assertTrue(eps[1][1].startswith('Штатно: резервная копия'), eps[1][1])
 
 
 class Daily(Tmp):
@@ -437,12 +642,15 @@ class Daily(Tmp):
         self.assertIn('Коротко:', out)
         bots = out.split('4. Кандидаты в бан', 1)[1].split('Активные, похожие на людей', 1)[0]
         people = out.split('Активные, похожие на людей', 1)[1].split('5. Работа', 1)[0]
-        self.assertIn('198.51.100.7', bots)                 # парсер («закрыл бы» в наблюдении) — кандидат
-        self.assertIn('похоже, бот', bots.split('198.51.100.7', 1)[1].split('Разбор:', 1)[0])
+        self.assertIn('198.51.100.8', bots)                 # парсер («закрыл бы» в наблюдении) — кандидат
+        self.assertIn('похоже, бот', bots.split('198.51.100.8', 1)[1].split('Разбор:', 1)[0])
+        self.assertNotIn('198.51.100.7 ', bots)             # пул без скриптов уже закрыт по-настоящему
         self.assertIn('192.0.2.10', people)                 # человек из поиска — отдельно, не в кандидатах
         self.assertNotIn('192.0.2.10 ', bots)
         self.assertNotIn('203.0.113.5 ', bots)              # сканер уже закрыт
         self.assertNotIn('← новое', out)                    # первый запуск — без пометок «новое»
+        self.assertIn('9. Пулы разовых адресов', out)
+        self.assertIn('10. Нагрузка сервера', out)
         who = quiet(ab.cmd_who, ab.Settings(conf), '198.51.100.7', 24)
         self.assertIn('За бота', who)
         self.assertIn('картинок и стилей 0', who)
