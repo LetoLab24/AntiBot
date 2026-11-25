@@ -30,7 +30,7 @@
 подтверждённые боты, пулы без скриптов); enforce — закрывает всех; report — никого не закрывает и nginx не трогает.
 MAIL_DRY=1 — письма в консоль.
 """
-VERSION = '0.2.0'
+VERSION = '0.2.1'
 
 import calendar, collections, configparser, glob, gzip, html, ipaddress, json, os, pickle, re
 import shlex, smtplib, socket, sqlite3, subprocess, sys, threading, time, traceback, urllib.parse, urllib.request

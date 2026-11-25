@@ -36,6 +36,9 @@ done
 say() { echo "== $*"; }
 die() { echo "ОШИБКА: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "нужен root (sudo ./install.sh)"
+# установщик сам работает от root; SUDO_USER от «sudo ./install.sh» antibot принял бы за учётку агента
+# и отказал в --nginx-files (найдено при первой установке на Ubuntu 24.04, 25.11.2026)
+unset SUDO_USER
 STAMP=$(date +%Y%m%d-%H%M%S)
 
 nginx_ok() { command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; }
