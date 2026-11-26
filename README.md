@@ -18,7 +18,7 @@ AntiBot стоит на вашем сервере и раз в минуту чи
 
 Разбирать подозрительных удобно с ИИ-агентом: Claude Code или Codex в VS Code. Агент снимает сводку, проверяет каждого кандидата, предлагает, кого закрыть, и закрывает только после вашего «да».
 
-Версия 0.2.1. Что изменилось — в `CHANGELOG.md`. Нашли ошибку или бот прошёл мимо — напишите в Issues.
+Версия 0.2.2. Что изменилось — в `CHANGELOG.md`. Нашли ошибку или бот прошёл мимо — напишите в Issues.
 
 ## Что нужно
 
@@ -88,6 +88,28 @@ sudo antibot --mode observe           вернуть наблюдение
 Через неделю наблюдения, если писем «закрыл бы зря?» не было или по ним всё ясно: `sudo antibot --mode enforce`. Записанные «закрыл бы» станут настоящими банами. Пороги правил можно поправить в `antibot.ini`, раздел `[thresholds]`.
 
 Если картинки сайта отдаёт CDN или другой домен, в журнале их нет ни у кого. Тогда правило «без скриптов» и письма о пулах молчат сами, чтобы не задеть людей. `sudo antibot --check-config` покажет, видна ли статика.
+
+## WooCommerce
+
+- **Адреса каталога.** Сторож знает `/product/`, `/product-category/`, `/product-tag/`, `/shop/`, `/catalog/`. Если у темы каталог в другой папке, `sudo antibot --check-config` напишет «Каталога почти не видно» и покажет частые папки — впишите свою в `antibot.ini`: `[patterns]`, `catalog = ^/ПАПКА/`.
+- **Store API отдаёт весь каталог с ценами** (`/wp-json/wc/store/v1/products?per_page=100`) — сотня запросов, и каталога нет, сторож не успеет. Если витрина не показывает товары скриптом через Store API (проверьте журнал: запросы к `/wc/store/…/products` от обычных посетителей), закройте его для гостей файлом `wp-content/mu-plugins/close-catalog-rest.php`. Корзина и оформление заказа продолжат работать:
+
+```php
+<?php
+add_filter('rest_pre_dispatch', function ($result, $server, $request) {
+    if ($result !== null || is_user_logged_in()) {
+        return $result;
+    }
+    if (preg_match('#^/(?:wc/store(?:/v\d+)?/products|wp/v2/(?:product|product_cat|product_tag|product_brand))(?:/|$)#i',
+                   (string) $request->get_route())) {
+        return new WP_Error('rest_no_route', 'No route was found matching the URL and request method.', array('status' => 404));
+    }
+    return $result;
+}, 5, 3);
+```
+
+Проверка: `curl -s -o /dev/null -w '%{http_code}\n' 'https://ваш-сайт/wp-json/wc/store/v1/products?per_page=1'` — 404, а `…/wp-json/wc/store/v1/cart` — 200.
+- **Индекс поиска и прайсы.** Если тема грузит для поиска один файл со всеми товарами (часто `.json` в `uploads`) или прайс лежит по прямой ссылке — это тоже весь каталог одним запросом. Цену из индекса поиска лучше убрать.
 
 ## Обновление и удаление
 

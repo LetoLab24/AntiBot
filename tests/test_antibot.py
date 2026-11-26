@@ -112,6 +112,29 @@ class Patterns(Tmp):
         self.assertTrue(r.is_product('/product/blue-case/', '/product/blue-case/'))
         self.assertEqual(r.page_number('/product-category/cases/page/9/'), 9)
         self.assertTrue(r.login.search('/wp-login.php'))
+        # 0.2.2: признак браузера — корзина и оформление Store API, каталог Store API — нет (его выкачивают программы)
+        for u in ('/wp-json/wc/store/v1/cart', '/wp-json/wc/store/v1/cart/add-item', '/wp-json/wc/store/checkout',
+                  '/wp-json/wc/store/v1/batch', '/?wc-ajax=get_refreshed_fragments'):
+            self.assertTrue(r.js.search(u), u)
+        for u in ('/wp-json/wc/store/v1/products?per_page=100', '/wp-json/wc/store/products',
+                  '/wp-json/wc/store/v1/products/categories'):
+            self.assertFalse(r.js.search(u), u)
+        for u in ('/product-category/cases/', '/shop/', '/shop/page/2/', '/catalog/iphone/displei/'):
+            self.assertTrue(r.catalog.search(u), u)
+
+    def test_check_config_catalog_hint(self):
+        # 0.2.2: адреса каталога не совпали с шаблоном движка — проверка настроек подсказывает папку
+        conf = write_conf(self.d, 'woocommerce')
+        t0 = int(time.time()) - 3600
+        with open(os.path.join(self.d, 'access.log'), 'w', encoding='utf-8') as f:
+            for i in range(600):
+                url = '/katalog/razdel-%d/' % (i % 40) if i % 3 else '/stati/%d/' % (i % 7)
+                f.write(make_log.line('198.51.100.%d' % (i % 50 + 1), t0 + i, 'GET', url)[1] + '\n')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ab.cmd_check_config(ab.Settings(conf))
+        self.assertIn('Каталога почти не видно', out.getvalue())
+        self.assertIn('/katalog/', out.getvalue())
 
     def test_bitrix(self):
         r = self.rules('bitrix')

@@ -5,7 +5,7 @@
 # {stem} — первая часть домена сайта (shop для shop.example).
 
 [meta]
-version = 2026.11.20.1
+version = 2026.11.26.1
 
 [thresholds]
 # окно правил, минут
@@ -337,10 +337,13 @@ own = ^/(?:admin|image|catalog/view)/
 
 [engine:woocommerce]
 product = ^/product/[^/?]+/?$
-catalog = ^/product-(?:category|tag)/
+# раздел: стандартные адреса WooCommerce и частые у тем /shop/, /catalog/ (свои — [patterns] catalog в antibot.ini)
+catalog = ^/(?:product-(?:category|tag)|shop|catalog)/
 search = [?&]s=[^&]*&(?:.*&)?post_type=product|[?&]post_type=product&(?:.*&)?s=
 page = /page/(\d+)/?
-js = [?&]wc-ajax=|^/wp-admin/admin-ajax\.php|^/wp-json/wc/store/
+# признак браузера — только корзина и оформление Store API: каталог Store API (/wc/store/…/products) выкачивают
+# программы, это не скрипт страницы
+js = [?&]wc-ajax=|^/wp-admin/admin-ajax\.php|^/wp-json/wc/store/(?:v\d+/)?(?:cart|checkout|batch)
 login = ^/wp-login\.php|^/xmlrpc\.php
 own = ^/wp-(?:admin|content|includes|json)/|^/wp-(?:login|cron)\.php|^/xmlrpc\.php|[?&]rest_route=
 static = ^/wp-content/uploads/

@@ -30,7 +30,7 @@
 подтверждённые боты, пулы без скриптов); enforce — закрывает всех; report — никого не закрывает и nginx не трогает.
 MAIL_DRY=1 — письма в консоль.
 """
-VERSION = '0.2.1'
+VERSION = '0.2.2'
 
 import calendar, collections, configparser, glob, gzip, html, ipaddress, json, os, pickle, re
 import shlex, smtplib, socket, sqlite3, subprocess, sys, threading, time, traceback, urllib.parse, urllib.request
@@ -2853,6 +2853,7 @@ def cmd_check_config(s):
         return
     ok = 0
     k = collections.Counter()
+    roots = collections.Counter()
     br_all = br_static = 0
     for line in tail:
         p = parser.parse(line)
@@ -2878,12 +2879,22 @@ def cmd_check_config(s):
             k['поиск'] += 1
         elif r.is_page(path, url, False):
             k['обычные страницы'] += 1
+            seg = path.split('/')
+            if len(seg) > 2 and seg[1]:
+                roots['/%s/' % seg[1]] += 1
         else:
             k['прочее'] += 1
         k['класс ' + r.ua_class(ua)[0]] += 1
     print('Последние %d строк журнала: разобрано %d (%d %%).' % (len(tail), ok, 100 * ok // max(len(tail), 1)))
     for name, n in k.most_common():
         print('  %-22s %6d  %3d %%' % (name, n, 100 * n // max(ok, 1)))
+    pages = k['товар'] + k['раздел'] + k['поиск'] + k['обычные страницы']
+    if ok >= 500 and pages >= 200 and (k['раздел'] + k['товар']) * 20 < pages:
+        top = ', '.join('%s %d' % x for x in roots.most_common(5))
+        print('Каталога почти не видно: карточки и разделы — %d из %d страниц. Похоже, адреса каталога у сайта другие, '
+              'чем в шаблоне движка, — тогда правила «без скриптов», «парсер», «пагинация» обходчиков каталога не '
+              'заметят. Чаще всего открывают: %s. Если это каталог — впишите в antibot.ini, раздел [patterns]: '
+              'catalog = ^/ПАПКА/ (и product, если карточки не там).' % (k['раздел'] + k['товар'], pages, top or '—'))
     if ok and not k['статика']:
         print('Статики в журнале нет: если картинки отдаёт CDN или другой домен, правила «без картинок» будут ловить '
               'людей — поднимите parser_products или задайте признак скриптов (patterns js).')
