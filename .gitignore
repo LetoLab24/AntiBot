@@ -4,3 +4,5 @@ __pycache__/
 state/
 *.log
 *.gz
+gate/config.php
+gate/data/
