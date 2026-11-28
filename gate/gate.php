@@ -9,13 +9,15 @@ if (!class_exists('AbGate', false)) {
 
 final class AbGate
 {
-    const VERSION = '0.2.1';
+    const VERSION = '0.3.0';
     const GROUPS = array('bans', 'nets', 'names', 'seo', 'patterns');
 
     public static $cfg = array();
     public static $ip = '';
     public static $ua = '';
     public static $ref = '';
+    public static $al = '';         // Accept-Language (с 0.3.0)
+    public static $whyLang = '';    // запрос закрыла связка по языку — на странице отказа совет про VPN
     public static $why = '';
     public static $tags = array();
     public static $uri = '/';
@@ -110,6 +112,7 @@ final class AbGate
         self::$method = isset($_SERVER['REQUEST_METHOD']) ? strtoupper((string)$_SERVER['REQUEST_METHOD']) : 'GET';
         self::$ua = isset($_SERVER['HTTP_USER_AGENT']) ? (string)$_SERVER['HTTP_USER_AGENT'] : '';
         self::$ref = isset($_SERVER['HTTP_REFERER']) ? (string)$_SERVER['HTTP_REFERER'] : '';
+        self::$al = isset($_SERVER['HTTP_ACCEPT_LANGUAGE']) ? substr((string)$_SERVER['HTTP_ACCEPT_LANGUAGE'], 0, 200) : '';
         $path = self::path(self::$uri);
         if ($path === '/wp-cron.php') {
             return;
@@ -544,9 +547,13 @@ final class AbGate
     }
 
     // Связка примет: все указанные условия сразу. ua, ref, path — регулярные выражения без учёта регистра,
-    // ua_in — имена целиком, noref — без Referer, method — GET/POST/HEAD.
-    public static function ruleMatch(array $r, $ua, $ref, $uri, $method)
+    // ua_in — имена целиком, noref — без Referer, method — GET/POST/HEAD, nolang — среди языков браузера нет такого
+    // (например ru: у покупателей из России он есть почти всегда, у сборщиков с зарубежных адресов — en-US).
+    public static function ruleMatch(array $r, $ua, $ref, $uri, $method, $al = null)
     {
+        if (!empty($r['nolang']) && self::langHas($al === null ? self::$al : (string)$al, $r['nolang'])) {
+            return false;
+        }
         if (!empty($r['method']) && $method !== $r['method']) {
             return false;
         }
@@ -566,6 +573,12 @@ final class AbGate
             return false;
         }
         return true;
+    }
+
+    // Есть ли язык среди языков браузера: «ru-RU,ru;q=0.9» и «en-US,en;q=0.9,ru;q=0.8» — да, «en-US,en;q=0.9» и пусто — нет.
+    public static function langHas($al, $lang)
+    {
+        return (bool)preg_match('~(?:^|[^a-z])' . preg_quote((string)$lang, '~') . '(?:[^a-z]|$)~i', (string)$al);
     }
 
     // Порядок: свои правила сайта, сканер на месте, затем общий список по выбору сайта (shared).
@@ -628,6 +641,7 @@ final class AbGate
                 if (self::ruleMatch($rule, $ua, $ref, $uri, $method)) {
                     $r = self::verdict((string)$rule['id'], ($pm === 'on' && $rule['mode'] === 'on') ? 'on' : 'watch', 1);
                     if ($r) {
+                        self::$whyLang = !empty($rule['nolang']) ? (string)$rule['nolang'] : '';
                         return $r;
                     }
                 }
@@ -679,6 +693,14 @@ final class AbGate
         if (!empty($r['noref'])) {
             $out['noref'] = true;
         }
+        if (isset($r['nolang']) && $r['nolang'] !== '' && $r['nolang'] !== false) {
+            $l = strtolower((string)$r['nolang']);
+            if (!preg_match('~^[a-z]{2,3}$~', $l)) {
+                $err = 'nolang: код языка из 2–3 латинских букв, например ru';
+                return null;
+            }
+            $out['nolang'] = $l;
+        }
         if (!empty($r['method'])) {
             $m = strtoupper((string)$r['method']);
             if (!in_array($m, array('GET', 'POST', 'HEAD'), true)) {
@@ -687,8 +709,10 @@ final class AbGate
             }
             $out['method'] = $m;
         }
-        if (empty($out['ua']) && empty($out['ua_in']) && empty($out['ref'])) {
-            $err = 'нужно ua, ua_in или ref: по одному адресу страницы или «без Referer» ходят и люди';
+        // язык браузера вместе с «без Referer» или адресом страницы — достаточно: у людей нужный язык есть почти всегда
+        if (empty($out['ua']) && empty($out['ua_in']) && empty($out['ref'])
+            && !(!empty($out['nolang']) && (!empty($out['noref']) || !empty($out['path'])))) {
+            $err = 'нужно ua, ua_in, ref или nolang вместе с noref или path: по одному адресу страницы или «без Referer» ходят и люди';
             return null;
         }
         if (!empty($out['ref']) && !empty($out['noref'])) {
@@ -826,6 +850,7 @@ final class AbGate
         }
         foreach ($m['rules'] as $r) {
             if (self::ruleMatch($r, $ua, $ref, $uri, $method)) {
+                self::$whyLang = !empty($r['nolang']) ? (string)$r['nolang'] : '';
                 return true;
             }
         }
@@ -847,6 +872,16 @@ final class AbGate
         }
         $ipH = htmlspecialchars($ip, ENT_QUOTES, 'UTF-8');
         $dom = htmlspecialchars((string)self::$cfg['domain'], ENT_QUOTES, 'UTF-8');
+        if (self::$whyLang !== '') {
+            return '<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,'
+                . 'initial-scale=1"><meta name="robots" content="noindex"><title>Страница не открылась' . ($dom ? ' — ' . $dom : '')
+                . '</title></head><body style="margin:0;background:#f5f6f8;color:#222;font:16px/1.55 Arial,Helvetica,sans-serif">'
+                . '<div style="max-width:560px;margin:48px auto;padding:28px 24px;background:#fff;border-radius:10px;'
+                . 'box-shadow:0 1px 4px rgba(0,0,0,.08)"><h1 style="margin:0 0 14px;font-size:22px">Страница не открылась</h1>'
+                . '<p>Похоже, вы заходите через VPN или браузер настроен не на русский язык — так к сайту часто приходят '
+                . 'программы-сборщики. Отключите VPN или добавьте русский язык в настройках браузера и откройте страницу заново.</p>'
+                . '<p>Если не помогло, ' . $how . ' и укажите ваш адрес: <b>' . $ipH . '</b>.</p></div></body></html>';
+        }
         return '<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,'
             . 'initial-scale=1"><meta name="robots" content="noindex"><title>Доступ временно ограничен' . ($dom ? ' — ' . $dom : '')
             . '</title></head><body style="margin:0;background:#f5f6f8;color:#222;font:16px/1.55 Arial,Helvetica,sans-serif">'
@@ -1117,7 +1152,7 @@ final class AbGate
             $uri = preg_replace('~([?&]k=)[^&]*~', '$1*', $uri);
         }
         $ref = isset($_SERVER['HTTP_REFERER']) ? (string)$_SERVER['HTTP_REFERER'] : '';
-        // 11-я колонка: что сработало — «!причина» закрыло запрос, без «!» — только отметка (watch)
+        // 11-я колонка: что сработало — «!причина» закрыло запрос, без «!» — только отметка (watch); 12-я — язык браузера (с 0.3.0)
         $tags = array_keys(self::$tags);
         if (self::$why !== '') {
             $tags[] = '!' . self::$why;
@@ -1125,7 +1160,7 @@ final class AbGate
         $line = implode("\t", array(
             time(), self::$ip, self::$method, self::$kind, self::clean($uri, 400), $code === false ? 200 : (int)$code,
             self::$hasMark ? 1 : 0, self::$exempt ? 1 : 0, self::clean(self::$ua, 300), self::clean($ref, 200),
-            self::clean(implode(',', $tags), 300),
+            self::clean(implode(',', $tags), 300), self::clean(self::$al, 80),
         )) . "\n";
         $dir = self::$cfg['data_dir'] . '/log';
         if (!is_dir($dir)) {
@@ -1311,7 +1346,8 @@ final class AbGate
                         $w[$id]['blocked']++;
                     }
                     if (!isset($w[$id]['ips'][$ip]) && count($w[$id]['samples']) < 5) {
-                        $w[$id]['samples'][] = array($ip, substr($ua, 0, 160), substr($ref, 0, 120), substr($uri, 0, 120));
+                        $w[$id]['samples'][] = array($ip, substr($ua, 0, 160), substr($ref, 0, 120), substr($uri, 0, 120),
+                            isset($c[11]) ? substr((string)$c[11], 0, 60) : '');
                     }
                     $w[$id]['ips'][$ip] = 1;
                 }

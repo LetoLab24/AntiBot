@@ -386,6 +386,33 @@ t('status: wrong key — nothing', ob_get_clean() === '');
 AbGate::serveStatus('');
 t('status: empty key — nothing', true);
 
+// 0.3.0: язык браузера в связках (nolang)
+t('lang: ru-RU есть', AbGate::langHas('ru-RU,ru;q=0.9', 'ru'));
+t('lang: ru вторым есть', AbGate::langHas('en-US,en;q=0.9,ru;q=0.8', 'ru'));
+t('lang: en-US нет ru', !AbGate::langHas('en-US,en;q=0.9', 'ru'));
+t('lang: пусто — нет', !AbGate::langHas('', 'ru'));
+t('lang: «ruby» не ru', !AbGate::langHas('xx-ruby', 'ru'));
+$e = '';
+$lr = AbGate::cleanRule(array('nolang' => 'RU', 'noref' => true, 'path' => '^/product/'), $e);
+t('nolang + noref + path — принята', is_array($lr) && $lr['nolang'] === 'ru' && $e === '');
+t('nolang один — не принята', AbGate::cleanRule(array('nolang' => 'ru'), $e) === null);
+t('nolang неверный — не принята', AbGate::cleanRule(array('nolang' => 'русский', 'noref' => true), $e) === null);
+t('без nolang noref + path — по-прежнему не принята', AbGate::cleanRule(array('noref' => true, 'path' => '^/product/'), $e) === null);
+t('nolang: en-US без Referer на карточке — совпала', AbGate::ruleMatch($lr, 'Mozilla/5.0 x', '', '/product/a', 'GET', 'en-US,en;q=0.9'));
+t('nolang: ru — нет', !AbGate::ruleMatch($lr, 'Mozilla/5.0 x', '', '/product/a', 'GET', 'ru-RU,ru;q=0.9'));
+t('nolang: с Referer — нет', !AbGate::ruleMatch($lr, 'Mozilla/5.0 x', 'https://yandex.ru/', '/product/a', 'GET', 'en-US'));
+t('nolang: другая страница — нет', !AbGate::ruleMatch($lr, 'Mozilla/5.0 x', '', '/', 'GET', 'en-US'));
+AbGate::$whyLang = 'ru';
+$bp = AbGate::banPage('203.0.113.9');
+t('страница отказа по языку — совет про VPN', strpos($bp, 'VPN') !== false && strpos($bp, '203.0.113.9') !== false);
+AbGate::$whyLang = '';
+t('обычная страница отказа — без VPN', strpos(AbGate::banPage('203.0.113.9'), 'VPN') === false);
+$lines = implode("	", array($now - 20, '203.0.113.140', 'GET', 'product', '/product/a', 200, 0, 0, 'Mozilla/5.0 y', '', 'lang-card', 'en-US,en;q=0.9')) . "
+";
+file_put_contents($logDir . '/' . date('Y-m-d', $now) . '.log', $lines);
+$agg = AbGate::aggregate($now);
+t('пример связки с языком', isset($agg['watch']['lang-card']['samples'][0][4]) && $agg['watch']['lang-card']['samples'][0][4] === 'en-US,en;q=0.9');
+
 rmtree($tmp);
 echo ($fails ? "FAILED $fails of $count\n" : "OK $count tests\n");
 exit($fails ? 1 : 0);
